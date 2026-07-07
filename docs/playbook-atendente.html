@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Playbook da Atendente — Integração CNN ↔ Kommo</title>
+<style>
+  @page { size: A4; margin: 16mm 14mm 16mm 14mm; }
+  * { box-sizing: border-box; }
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body {
+    font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #1f2933; font-size: 10.5pt; line-height: 1.5; margin: 0;
+  }
+  h1 { font-size: 24pt; margin: 0 0 2mm; color: #0b7285; }
+  h2 { font-size: 15pt; margin: 0 0 3mm; color: #0b7285; border-bottom: 2px solid #0b7285; padding-bottom: 1.5mm; }
+  h3 { font-size: 12pt; margin: 4mm 0 1.5mm; color: #12557a; }
+  p { margin: 0 0 2mm; }
+  ul, ol { margin: 0 0 2mm; padding-left: 5mm; }
+  li { margin: 0 0 1mm; }
+  strong { color: #102a43; }
+  .sub { color: #52606d; font-size: 10pt; }
+  .section { page-break-inside: avoid; margin-bottom: 7mm; }
+  .pagebreak { page-break-before: always; }
+  .cover { text-align: left; padding: 8mm 0 6mm; border-bottom: 3px solid #0b7285; margin-bottom: 6mm; }
+  .cover .tag { display:inline-block; background:#0b7285; color:#fff; font-size:9pt; font-weight:600; padding:1mm 3mm; border-radius: 3px; letter-spacing:.3px; }
+  .lead { font-size: 11.5pt; color:#334e68; }
+  table { width: 100%; border-collapse: collapse; margin: 2mm 0 3mm; font-size: 9.7pt; }
+  th, td { border: 1px solid #cbd5e0; padding: 2mm 2.5mm; text-align: left; vertical-align: top; }
+  th { background: #e6fcf5; color:#0b525b; font-weight: 600; }
+  .callout { border-radius: 5px; padding: 3mm 4mm; margin: 2mm 0 3mm; page-break-inside: avoid; }
+  .do   { background:#ebfbee; border-left: 4px solid #2f9e44; }
+  .dont { background:#fff5f5; border-left: 4px solid #e03131; }
+  .warn { background:#fff9db; border-left: 4px solid #f08c00; }
+  .info { background:#e7f5ff; border-left: 4px solid #1c7ed6; }
+  .callout .t { font-weight: 700; display:block; margin-bottom: 1mm; }
+  .do .t { color:#2b8a3e; } .dont .t { color:#c92a2a; } .warn .t { color:#e67700; } .info .t { color:#1971c2; }
+  .flow { border:1px solid #d0dae6; border-radius:6px; padding: 3mm 4mm; margin-bottom: 4mm; page-break-inside: avoid; }
+  .flow h3 { margin-top: 0; }
+  .flow .grid { display:block; }
+  .flow .row { display:flex; gap: 3mm; margin-bottom: 1.5mm; }
+  .flow .row .lbl { flex: 0 0 34mm; font-weight:600; color:#0b7285; font-size: 9.5pt; }
+  .flow .row .val { flex: 1; }
+  .pill { display:inline-block; font-size:8.5pt; font-weight:600; padding:0.5mm 2mm; border-radius:3px; }
+  .pillA { background:#d0ebff; color:#1864ab; }
+  .pillB { background:#ffe3e3; color:#c92a2a; }
+  .muted { color:#829ab1; font-size: 9pt; }
+  .kbd { background:#f0f4f8; border:1px solid #cbd5e0; border-radius:3px; padding:0 1.5mm; font-family: Consolas, monospace; font-size:9pt; }
+  ol.big { counter-reset: step; list-style:none; padding-left:0; }
+  ol.big > li { position: relative; padding-left: 8mm; margin-bottom: 1.5mm; }
+  ol.big > li:before { counter-increment: step; content: counter(step); position:absolute; left:0; top:0.3mm;
+    width:5.5mm; height:5.5mm; background:#0b7285; color:#fff; border-radius:50%; text-align:center; font-size:8.5pt; line-height:5.5mm; font-weight:700; }
+  .footer { margin-top:6mm; padding-top:2mm; border-top:1px solid #cbd5e0; color:#829ab1; font-size:8.5pt; }
+</style>
+</head>
+<body>
+
+<div class="cover">
+  <span class="tag">GUIA OPERACIONAL · ATENDIMENTO</span>
+  <h1>Playbook da Atendente</h1>
+  <p class="lead">Como usar a <strong>Clínica nas Nuvens (CNN)</strong> e o <strong>Kommo</strong> com a integração automática — o que fazer, o que evitar, e o que esperar.</p>
+  <p class="muted">Clínica Bergmann · Guia prático para o dia a dia · Mantido pela equipe técnica</p>
+</div>
+
+<div class="section">
+  <h2>1. Entenda os dois sistemas (o mais importante)</h2>
+  <p>Você trabalha com <strong>dois sistemas que conversam sozinhos</strong> por meio de um robô (a integração):</p>
+  <table>
+    <tr><th style="width:32%">Sistema</th><th>Para que serve</th></tr>
+    <tr><td><strong>CNN — Clínica nas Nuvens</strong></td><td>A <strong>agenda clínica de verdade</strong>: consultas, procedimentos, status do paciente, orçamentos. É a <strong>fonte da verdade</strong> da agenda.</td></tr>
+    <tr><td><strong>Kommo (CRM)</strong></td><td>O <strong>funil de vendas</strong> e os <strong>WhatsApps automáticos</strong> (Salesbot). Cada paciente vira um <em>card</em> que anda pelas etapas.</td></tr>
+  </table>
+  <div class="callout info">
+    <span class="t">A regra que resume tudo</span>
+    O robô junta os dois sistemas a cada <strong>~1 minuto</strong>. Você faz a marcação <strong>em um sistema</strong> e o outro <strong>se atualiza sozinho</strong>. Não precisa digitar a mesma marcação de novo no outro.
+  </div>
+  <div class="callout do">
+    <span class="t">🔓 Use o CNN à vontade — só não digite a MESMA marcação nos dois sistemas</span>
+    <ul>
+      <li>Pode usar o CNN <strong>o quanto quiser</strong>: marque, remarque e cancele <strong>quantos horários precisar, para quantos pacientes precisar</strong>. Marcar <strong>vários horários para o mesmo paciente</strong> no CNN é <strong>normal</strong> — faça sem medo.</li>
+      <li>Toda marcação que você faz no CNN <strong>aparece sozinha no Kommo</strong> em ~1 minuto (o robô copia). O mesmo paciente estar <strong>nos dois sistemas ao mesmo tempo é normal</strong> — é o robô trabalhando, <strong>não é erro</strong>.</li>
+      <li><strong>O único cuidado</strong> é este: não digite <strong>a mesma marcação</strong> (mesmo paciente + mesmo horário) <strong>com a sua mão nos dois lugares</strong>. <br>
+      <span class="muted">Exemplo: você marcou a consulta da <strong>Dona Maria, dia 10 às 14h</strong>, no CNN. <strong>Pronto.</strong> O card dela aparece sozinho no Kommo. <strong>NÃO</strong> marque essa mesma consulta do dia 10 outra vez no Kommo — senão fica <strong>agenda repetida</strong>.</span></li>
+      <li><strong>Regra de bolso:</strong> marcou no CNN → <strong>deixa o Kommo se atualizar sozinho</strong>. Não precisa fazer nada no Kommo.</li>
+      <li><strong>Única coisa que nasce no Kommo de propósito:</strong> escolher o <span class="kbd">Tipo Procedimento CNN</span> num card de pós-venda (fluxo E). Fora isso, marque no CNN.</li>
+    </ul>
+  </div>
+  <p><strong>Como o robô sincroniza (as duas direções):</strong></p>
+  <ul>
+    <li><strong>CNN → Kommo (sempre ligado):</strong> tudo que muda na agenda do CNN (novo horário, confirmação, cancelamento, orçamento) <strong>reflete sozinho no card do Kommo</strong> em ~1 min.</li>
+    <li><strong>Kommo → CNN (por ação sua):</strong> quando você mexe no card do Kommo (confirma, agenda um procedimento, remarca), o robô <strong>escreve de volta no CNN</strong>. <span class="muted">⏳ Estas ações são liberadas pela equipe técnica por etapa — pergunte o que já está ativo.</span></li>
+  </ul>
+</div>
+
+<div class="section">
+  <h2>2. As regras de ouro</h2>
+  <div class="callout do">
+    <span class="t">✔ PODE / DEVE</span>
+    <ul>
+      <li>Fazer a ação em <strong>um sistema só</strong> e <strong>esperar ~1 min</strong> o robô replicar.</li>
+      <li>Deixar o robô <strong>mover os cards</strong> entre as etapas — ele faz isso pelo status real da agenda.</li>
+      <li>Preencher os campos que <strong>você</strong> controla (ex.: <span class="kbd">Tipo Procedimento CNN</span> num card de pós-venda).</li>
+      <li>Conferir e agir nas <strong>tarefas</strong> que o robô cria pra você (ex.: revisar um card <strong>[Familia]</strong>).</li>
+    </ul>
+  </div>
+  <div class="callout dont">
+    <span class="t">✘ NÃO PODE / EVITE</span>
+    <ul>
+      <li><strong>Não</strong> crie a mesma agenda nos dois sistemas — escolha um e deixe o robô copiar.</li>
+      <li><strong>Não</strong> apague paciente ou agenda achando que o robô recria — ele <strong>não</strong> recria o que foi apagado, e o robô <strong>nunca</strong> apaga nada (por segurança).</li>
+      <li><strong>Não</strong> edite à mão os campos técnicos do card: <span class="kbd">ID Agenda CNN</span>, <span class="kbd">ID Paciente CNN</span>, <span class="kbd">AGENDAMENTO</span>. São do robô.</li>
+      <li><strong>Não</strong> arraste o card “na força” para uma etapa — se o status no CNN não bater, o robô devolve.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="section pagebreak">
+  <h2>3. Os funis do Kommo (mapa das etapas)</h2>
+  <p>Cada tipo de atendimento vai para um funil. O robô decide o funil pelo <strong>tipo da agenda no CNN</strong> — não pelo card.</p>
+  <table>
+    <tr><th style="width:22%">Grupo</th><th style="width:30%">Tipos de agenda (CNN)</th><th>Funil / etapas no Kommo</th></tr>
+    <tr>
+      <td><span class="pill pillA">GRUPO A</span><br>Consulta / Avaliação</td>
+      <td>Consulta, Avaliação, Atendimento Social</td>
+      <td><strong>Funil de Captação</strong> → Consulta Agendada · Confirmação de Consulta · Consulta Confirmada · Avaliação Realizada · Perdido</td>
+    </tr>
+    <tr>
+      <td><span class="pill pillB">GRUPO B</span><br>Procedimentos</td>
+      <td>Procedimento, Cirurgia, Pequenas Cirurgias, Encaixe, Retorno, Cortesia, Encaminhamento-INTERNO</td>
+      <td><strong>Funil de Pós-Venda</strong> → Cliente Ativo · Confirmação de Agendamento · Tratamento Iniciado · Perdido</td>
+    </tr>
+  </table>
+  <div class="callout info">
+    <span class="t">Há um 3º funil: Pós-Consulta (usado pelo orçamento)</span>
+    Ao refletir um <strong>orçamento</strong> (fluxo F), o robô usa o funil <strong>Pós-Consulta</strong>: <strong>Em Análise</strong> (orçamento em aberto) e <strong>Venda Perdida</strong> (cancelado/perdido). Orçamento <strong>aprovado</strong> vai para <strong>Tratamento Iniciado</strong> no Pós-Venda.
+  </div>
+  <div class="callout warn">
+    <span class="t">⚑ “Cliente Ativo” não quer dizer “tem horário agora”</span>
+    No Pós-Venda, <strong>Cliente Ativo</strong> reúne todos os clientes com tratamento/procedimento ativo — mesmo sem consulta marcada no momento. Não estranhe um cliente ativo sem horário.
+  </div>
+</div>
+
+<div class="section">
+  <h2>4. Fluxo por fluxo — o que fazer em cada situação</h2>
+  <p class="sub">Em cada card abaixo: <strong>o que você faz</strong>, <strong>o que o robô faz sozinho</strong>, <strong>o que esperar</strong> e o <strong>cuidado</strong> principal.</p>
+
+  <div class="flow">
+    <h3>A. Agendar uma consulta nova</h3>
+    <div class="row"><div class="lbl">Você faz</div><div class="val">Marca a consulta <strong>no CNN</strong> (agenda clínica). É o caminho oficial para <strong>consultas novas</strong>.</div></div>
+    <div class="row"><div class="lbl">O robô faz</div><div class="val">Cria/atualiza o <strong>card no Kommo</strong> sozinho e preenche os IDs — o card entra em <strong>Consulta Agendada</strong>.</div></div>
+    <div class="row"><div class="lbl">Espere</div><div class="val">Em ~1 min o card aparece em <strong>Consulta Agendada</strong> com os dados preenchidos.</div></div>
+    <div class="row"><div class="lbl">Cuidado</div><div class="val">Consultas <strong>novas</strong> nascem no <strong>CNN</strong> — criar consulta pelo Kommo ainda <strong>não</strong> escreve no CNN de produção (não cria paciente). Não marque a mesma consulta nos dois.</div></div>
+  </div>
+
+  <div class="flow">
+    <h3>B. Confirmação da consulta (véspera)</h3>
+    <div class="row"><div class="lbl">Você faz</div><div class="val">Nada no automático. O sistema cuida da véspera.</div></div>
+    <div class="row"><div class="lbl">O robô faz</div><div class="val">No dia anterior (<strong>seg–sex às 15h</strong>; sábado às 11h confirma segunda), move o card para <strong>Confirmação de Consulta</strong> (Grupo A) ou <strong>Confirmação de Agendamento</strong> (Grupo B) e o Salesbot manda o WhatsApp. Quando o paciente responde “confirmo”, o robô marca <strong>confirmado</strong> no CNN. <span class="muted">O card do Grupo A vai para <strong>Consulta Confirmada</strong>; o do Grupo B <strong>permanece em Cliente Ativo</strong>.</span></div></div>
+    <div class="row"><div class="lbl">Espere</div><div class="val">1 WhatsApp por paciente por dia. Confirmação reflete no CNN em ~1 min.</div></div>
+    <div class="row"><div class="lbl">Cuidado</div><div class="val">Não confirme manualmente pelo card se o paciente ainda não respondeu — deixe o fluxo correr.</div></div>
+  </div>
+
+  <div class="flow">
+    <h3>C. Remarcar um horário</h3>
+    <div class="row"><div class="lbl">Você faz</div><div class="val">Muda o horário <strong>no CNN</strong> (na agenda clínica).</div></div>
+    <div class="row"><div class="lbl">O robô faz</div><div class="val">Atualiza o horário no card do Kommo <strong>sozinho</strong> e reposiciona o card (se estava em confirmação, volta para Consulta Agendada / Cliente Ativo).</div></div>
+    <div class="row"><div class="lbl">Espere</div><div class="val">Novo horário refletido no card em ~1 min. <strong>Não precisa fazer nada no Kommo.</strong></div></div>
+    <div class="row"><div class="lbl">Cuidado</div><div class="val">Remarque <strong>no CNN</strong> — não edite o horário no card do Kommo achando que precisa “avisar”; o card se atualiza sozinho.</div></div>
+  </div>
+
+  <div class="flow">
+    <h3>D. Cancelamento / paciente faltou</h3>
+    <div class="row"><div class="lbl">Você faz</div><div class="val">Registra o cancelamento/falta <strong>no CNN</strong> (status da agenda).</div></div>
+    <div class="row"><div class="lbl">O robô faz</div><div class="val"><span class="pill pillA">A</span> Consulta cancelada → card vai para <strong>Perdido</strong>. <span class="pill pillB">B</span> Procedimento cancelado → o cliente <strong>continua Cliente Ativo</strong> (não vira perdido — ele segue em tratamento).</div></div>
+    <div class="row"><div class="lbl">Espere</div><div class="val">O card se ajusta sozinho em ~1 min conforme o grupo.</div></div>
+    <div class="row"><div class="lbl">Cuidado</div><div class="val">Não “force” o card para Perdido no Pós-Venda — no Grupo B isso é intencional que fique ativo.</div></div>
+  </div>
+
+  <div class="flow">
+    <h3>E. Agendar um procedimento (Pós-Venda) — campo “Tipo Procedimento CNN”</h3>
+    <div class="row"><div class="lbl">Você faz</div><div class="val">No card de pós-venda em <strong>Cliente Ativo</strong>: preencha o <strong>horário</strong> e escolha o <span class="kbd">Tipo Procedimento CNN</span> (Procedimento, Cirurgia, Retorno, Encaixe, Pequenas Cirurgias, Cortesia, Encaminhamento-INTERNO).</div></div>
+    <div class="row"><div class="lbl">O robô faz</div><div class="val">Cria a <strong>agenda do procedimento no CNN</strong> com o tipo que você escolheu e grava os IDs no card.</div></div>
+    <div class="row"><div class="lbl">Espere</div><div class="val">Agenda criada no CNN em ~1 min. Se você não escolher o tipo, o robô <strong>não</strong> cria (e o card fica sem agenda).</div></div>
+    <div class="row"><div class="lbl">Cuidado</div><div class="val">O paciente precisa <strong>já existir no CNN</strong> (o card tem o ID Paciente). O robô <strong>não</strong> cria paciente novo por aqui — só agenda. Escolha o tipo certo: ele define o procedimento no sistema clínico.</div></div>
+  </div>
+
+  <div class="flow">
+    <h3>F. Orçamento aprovado / perdido (automático)</h3>
+    <div class="row"><div class="lbl">Você faz</div><div class="val">Trabalha o orçamento normalmente <strong>no CNN</strong>.</div></div>
+    <div class="row"><div class="lbl">O robô faz</div><div class="val">Reflete no funil: orçamento <strong>aprovado</strong> → <strong>Tratamento Iniciado</strong> (Pós-Venda); <strong>cancelado/perdido</strong> → <strong>Venda Perdida</strong>; <strong>em aberto</strong> → <strong>Em Análise</strong>.</div></div>
+    <div class="row"><div class="lbl">Espere</div><div class="val">O card se move sozinho quando o status do orçamento muda (só para clientes <strong>sem consulta futura marcada</strong> — quando há agenda, ela manda).</div></div>
+    <div class="row"><div class="lbl">Cuidado</div><div class="val">Não mova o card à mão para “Tratamento Iniciado” — o robô faz isso ao aprovar o orçamento.</div></div>
+  </div>
+</div>
+
+<div class="section pagebreak">
+  <h2>5. Cards especiais (não é erro)</h2>
+  <div class="callout warn">
+    <span class="t">Card com “[Familia]” no nome</span>
+    Quando <strong>2 pacientes usam o mesmo telefone</strong> (marido e esposa, mãe e filha), eles caem no <strong>mesmo card</strong>. O robô marca <strong>[Familia]</strong> no nome e, por segurança, <strong>não confirma nem escreve no CNN sozinho</strong> — para não mexer no paciente errado. <strong>Você confirma/agenda esses à mão</strong> e trata a tarefa de revisão que aparecer.
+  </div>
+  <div class="callout info">
+    <span class="t">Mesmo paciente com 2 cards (um em Captação, outro em Pós-Venda)</span>
+    É <strong>intencional</strong>. Um paciente pode ter uma <strong>consulta (Grupo A)</strong> e um <strong>procedimento (Grupo B)</strong> em dias diferentes — cada um vive no seu funil, com sua própria mensagem de WhatsApp. Não junte nem apague.
+  </div>
+</div>
+
+<div class="section">
+  <h2>6. O que esperar (tempos e sinais)</h2>
+  <table>
+    <tr><th style="width:38%">Situação</th><th>O que esperar</th></tr>
+    <tr><td>Fiz uma mudança num sistema</td><td>Refletir no outro em <strong>~1 minuto</strong>. Não precisa repetir.</td></tr>
+    <tr><td>Confirmações de véspera</td><td>Disparam <strong>seg–sex 15h</strong> (para o dia seguinte) e <strong>sáb 11h</strong> (para segunda). Domingo não roda.</td></tr>
+    <tr><td>WhatsApp de confirmação</td><td><strong>1 por paciente por dia</strong>. Cards <strong>[Familia]</strong> não recebem automático.</td></tr>
+    <tr><td>Remarquei uma consulta no CNN</td><td>O card atualiza o horário sozinho em ~1 min (e volta de “confirmação” para “agendada”, se estava confirmando).</td></tr>
+    <tr><td>Card não moveu ainda</td><td>Aguarde 1–2 min. Se passar disso, veja a seção 8.</td></tr>
+  </table>
+</div>
+
+<div class="section">
+  <h2>7. O que NUNCA fazer</h2>
+  <div class="callout dont">
+    <span class="t">✘ Lista de proibições</span>
+    <ol>
+      <li><strong>Apagar</strong> paciente ou agenda esperando que o robô recrie. Ele não recria — e nunca apaga nada.</li>
+      <li>Criar a <strong>mesma agenda</strong> no CNN <em>e</em> no Kommo. Escolha um.</li>
+      <li>Editar à mão <span class="kbd">ID Agenda CNN</span>, <span class="kbd">ID Paciente CNN</span> ou <span class="kbd">AGENDAMENTO</span> no card.</li>
+      <li>Mover o card para uma etapa que <strong>não bate</strong> com o status real do CNN (o robô desfaz).</li>
+      <li>Confirmar/agendar <strong>sozinha</strong> um card <strong>[Familia]</strong> sem conferir de qual paciente se trata.</li>
+      <li>Mover à mão para <strong>Tratamento Iniciado</strong> / <strong>Perdido</strong> — isso é decisão do robô pelo orçamento/agenda.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="section">
+  <h2>8. Quando algo parece errado</h2>
+  <table>
+    <tr><th style="width:40%">Sintoma</th><th>O que fazer</th></tr>
+    <tr><td>O card não moveu depois de eu mexer no CNN</td><td>Espere 1–2 min (o robô roda a cada minuto). Persistindo, avise a equipe técnica.</td></tr>
+    <tr><td>O WhatsApp de confirmação não saiu</td><td>Veja se o card tem <strong>[Familia]</strong> (esses são manuais). Senão, avise a equipe.</td></tr>
+    <tr><td>Apareceu agenda/card duplicado</td><td><strong>Não</strong> apague por conta própria — avise a equipe técnica para reconciliar.</td></tr>
+    <tr><td>Card em “Cliente Ativo” sem horário</td><td>Normal — é cliente com tratamento ativo. Não é erro.</td></tr>
+  </table>
+  <div class="callout info">
+    <span class="t">Regra de bolso para dúvida</span>
+    Na dúvida entre “eu faço” ou “o robô faz”: se é <strong>agenda/status/orçamento</strong>, provavelmente o robô reflete sozinho — <strong>faça em um lugar e espere</strong>. Se é um <strong>card [Familia]</strong> ou uma <strong>tarefa</strong> que o robô te passou, aí é <strong>com você</strong>.
+  </div>
+  <div class="footer">
+    Playbook da Atendente — Integração Clínica nas Nuvens ↔ Kommo · Dúvidas ou algo fora do descrito: falar com a equipe técnica (Marcos Venâncio).
+  </div>
+</div>
+
+</body>
+</html>

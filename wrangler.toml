@@ -1,0 +1,20 @@
+name = "kommo-cnn"
+main = "src/index.ts"
+compatibility_date = "2025-06-08"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "kommo-cnn-db"
+database_id = "158f672c-1589-439d-b550-8917f424c3ab"
+
+[vars]
+KOMMO_SUBDOMAIN = "atendimentoclinicabergmanncombr"
+# Webhooks Kommo→CNN (2026-07). GO-LIVE 07/07: LIGADOS, escrita em PRODUÇÃO.
+CNN_WRITE_TARGET = "production"
+WH1_ENABLED = "1"
+WH2_ENABLED = "1"
+
+[triggers]
+# Dispatcher único: a cada minuto reseta orçamento, roda produtores no horário
+# (confirmação Seg–Sex 18h UTC / Sáb 14h UTC; sync a cada 10 min) e drena a fila.
+crons = ["* * * * *"]

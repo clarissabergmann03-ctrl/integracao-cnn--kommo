@@ -1,0 +1,26 @@
+# ─── Segredos — NUNCA commitar ──────────────────────────────
+.env
+.env.local
+.env.*.local
+.dev.vars
+setup-secrets.ps1        # contém/gera secrets
+
+# ─── Dados de PACIENTES (LGPD) — NUNCA commitar ─────────────
+*.dump
+dump*.sql
+backfill-preview-*.csv
+IMPORTACAO-*.csv
+
+# ─── Dependências / build ───────────────────────────────────
+node_modules/
+dist/
+.wrangler/
+
+# ─── Supabase (local) ───────────────────────────────────────
+supabase/.branches/
+supabase/.temp/
+
+# ─── Sistema / logs ─────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log
