@@ -2300,7 +2300,7 @@ async function consumirItemA3(item: any, env: Env, target: CnnTarget, dryRun: bo
 // ══ FILA: Produtor F2 (véspera) ═══════════════════════════════════════════════
 // Enfileira leads (mapeados) com consulta AMANHÃ, status não-terminal, dedup B-first
 // por lead, que ainda não receberam lembrete hoje (lembrete_d1). Idempotente.
-async function produtorVespera(env: Env, target: CnnTarget, dataAlvo?: string): Promise<any> {
+async function produtorVespera(env: Env, target: CnnTarget, dataAlvo?: string, soPid?: string): Promise<any> {
   await ensureSchema(env);
   const tiposMap = await resolveTiposConsulta(env, target);
   const amanha = dataAlvo ?? tomorrowBRT();
@@ -2339,6 +2339,7 @@ async function produtorVespera(env: Env, target: CnnTarget, dataAlvo?: string): 
 
   const aEnfileirar: any[] = [];
   for (const [pid, grupos] of porPac) {
+    if (soPid && pid !== soPid) continue; // validação escopada: só o paciente de teste (blast radius = 1)
     const alvos: Array<"A" | "B"> = grupos.A ? ["A"] : ["B"]; // A vence no mesmo dia (anti-spam); senão o grupo presente
     for (const g of alvos) {
       const agendaId = grupos[g]!;
@@ -5565,7 +5566,7 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
         if (u.searchParams.get("clear") === "1") { await env.DB.prepare("DELETE FROM fila_trabalho").run(); out.fila_limpa = true; }
         if (runProd) {
           if (job === "sync") out.produtor = await produtorSync(env, target, windowDays);
-          else if (job === "vespera") out.produtor = await produtorVespera(env, target, u.searchParams.get("data") ?? undefined);
+          else if (job === "vespera") out.produtor = await produtorVespera(env, target, u.searchParams.get("data") ?? undefined, u.searchParams.get("sopid") ?? undefined);
           else if (job === "orcamento") out.produtor = await produtorOrcamento(env, target, budget);
           else out.produtor = await produtorBackfill(env, target, windowDays, soTeste);
         }
