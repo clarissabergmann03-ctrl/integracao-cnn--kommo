@@ -4085,7 +4085,7 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
     const df = url.searchParams.get("df") ?? di;
     const localFiltro = url.searchParams.get("local") ?? "";
     try { const r: any = await cnnGet(`/agenda/lista?dataInicial=${di}&dataFinal=${df}&registrosPorPagina=200&pagina=0`, env, target);
-      let ags = (r?.lista ?? []).map((a: any) => ({ hi: a.horaInicio, hf: a.horaFim, local: a.idLocalAgenda, tipo: a.idTipoConsulta, status: a.status }));
+      let ags = (r?.lista ?? []).map((a: any) => ({ hi: a.horaInicio, hf: a.horaFim, local: a.idLocalAgenda, tipo: a.idTipoConsulta, status: a.status, proc: (a.procedimentos ?? []).length }));
       if (localFiltro) ags = ags.filter((a: any) => String(a.local) === localFiltro);
       ags.sort((a: any, b: any) => String(a.hi).localeCompare(String(b.hi)));
       out.di = di; out.df = df; out.local_filtro = localFiltro || null; out.agenda_total = ags.length; out.ocupados = ags; }
@@ -5485,6 +5485,12 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
     if (pathname === "/debug-criar-agenda") {
       if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
       return handleDebugCriarAgenda(req, env);
+    }
+
+    if (pathname === "/debug-webhooks") { // lista os webhooks configurados no Kommo (P1 do go-live) — read-only
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      try { const w: any = await kommoGet("/webhooks", env); return Response.json(w); }
+      catch (e) { return Response.json({ erro: String(e) }, { status: 502 }); }
     }
 
     if (pathname === "/debug-fixture-teste") { // monta o paciente/agenda de teste em produção (escopo travado)
