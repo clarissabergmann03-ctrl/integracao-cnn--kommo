@@ -126,6 +126,21 @@ Worker Cloudflare (Free) que integra **Clínica nas Nuvens (CNN) → Kommo CRM**
 - **Validação write end-to-end (paciente teste 11946800329):** BLOQUEADA — paciente **não existe no CNN produção** (0 agendas/0 orçamentos p/ 28155333 e 28146949; IDs no lead Kommo 17488447 = resíduo sandbox). Precisa fixture: paciente+agenda REAIS no CNN produção.
 - Secrets CNN sandbox não subidos (eram do ambiente de teste).
 
+**🔴 ACHADOS CRÍTICOS (fixture paciente de teste em produção, 07/07):**
+- **Constantes de criação de agenda são de SANDBOX — falham em PRODUÇÃO.** Descoberto ao montar o fixture; valem para o Worker CF (`src/index.ts`) TAMBÉM. Mapa sandbox→produção (lidos do CNN prod real):
+  | Constante (code) | sandbox | **produção** |
+  |---|---|---|
+  | `CNN_CONVENIO_PARTICULAR` | 56545 | **27603** (nomeTipoConvenio "Particular") |
+  | `CNN_TIPO_CONSULTA` | 110452 | **66666** Consulta/Avaliação · 66671 Atend. Social · 66672 RETORNO · 66670 Procedimento · 93892 Cirurgia · 66668 Encaixe |
+  | `CNN_LOCAL_AGENDA` | 41170 | **19775 / 19779** (salas reais) |
+  | `CNN_TIPO_PROCEDIMENTO` | 1011844 | outros (ex. 381357 "Av Botox"); há ~100 tipos |
+  → **Implicação:** W1 (`handleLeadAgendado`) e W2 (`handlePosVendaAgendar`) criando agenda em produção **falhariam hoje** (400 "convênio obrigatório" → "tipo de atendimento não existe" → "procedimento obrigatório"). Precisa tornar essas constantes **target-condicionais** (sandbox vs produção) antes de qualquer go-live real de criação de agenda. PENDÊNCIA.
+- **Regras do `POST /agenda/novo` (produção, confirmadas):** procedimento é **obrigatório** p/ QUALQUER tipo (inclusive Atendimento Social); horário **fora do expediente** é bloqueado (03:00 e 07:00 → "fora do horário de atendimento"); conflito de sala/horário é validado (ex. sala 19775 já ocupada 10:00/12:30 em 07/07).
+- **Filtros do `/paciente/lista`:** `nomeContem` FUNCIONA; `telefoneCelularContem` e `limite` são **IGNORADOS** (voltam sempre a 1ª página genérica). Dedup de paciente por telefone tem que ser **client-side** (buscar por nome/lista e casar `fxTelKey` do telefone) — NÃO confiar no filtro do servidor. Isso afeta o dedup por telefone do sistema (linha ~2799 `telefoneCelularContem`).
+- **3 pacientes DUPLICADOS criados em produção** (artefato das tentativas que falhavam na agenda após criar o paciente): "Bruno �[Teste]" ids **28524071, 28524126, 28524693**, todos tel `11946800329`. NÃO deletáveis (guardrail). Inertes (sem agenda). Remoção manual na tela do CNN se o dono quiser. O endpoint `/debug-fixture-teste` agora deduplica por telefone → reusa o 28524071, não cria mais.
+- **Endpoint criado:** `/debug-fixture-teste?modo=probe|convenios|tipos|criar` (escopo TRAVADO ao tel/lead de teste; auth `Authorization: WEBHOOK_SECRET`). `criar` aceita `?convenio=&tipoConsulta=&localAgenda=&tipoProc=&hora=&data=&nome=&forcar=1`. Só cria paciente com `&forcar=1` (fetch direto — única exceção autorizada ao §7.8; guardrail global intacto).
+- **Fixture AINDA NÃO concluído:** agenda de teste não criada (faltava achar slot livre na sala 19775 dentro do expediente). Deploy atual do endpoint: `kommo-csqdzanaq-…vercel.app`.
+
 **Aprendizados Vercel/Supabase:** imports `.js` (NodeNext — `.ts` dá `ERR_MODULE_NOT_FOUND`); `typescript` nas devDeps faz a Vercel type-checar (TS2347 = warnings não-fatais); `ssoProtection:null` via API p/ público; env via API `/v10/projects/{id}/env?upsert=true`; pooler = `aws-1-sa-east-1` (não aws-0); token CF IP-restrito (IP de saída 200.149.56.26, oscila).
 
 ## Trabalho em andamento
