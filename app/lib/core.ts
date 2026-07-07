@@ -5313,6 +5313,61 @@ async function handleContarLeads(req: Request, env: Env): Promise<Response> {
   return Response.json(out);
 }
 
+// ══ /debug-nome-base — survey/fix do NOME na BASE INTEIRA do Kommo (pagina /leads: inclui ganho/perdido/
+// sem-vínculo), diferente do /debug-nome (só mapeamento/ativos). Nome real: se tem ID Paciente CNN →
+// cnnPacienteNome; senão usa o nome do contato (se bom). Preserva sufixo "(duplicata)" existente.
+// Escopo travado: só campo `name` do lead e do contato. survey = leitura pura (rápido). Pagina por ?pagina=.
+async function handleDebugNomeBase(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const modo = url.searchParams.get("modo") ?? "survey";
+  const dry = url.searchParams.get("dry") !== "0";
+  const target: CnnTarget = "production";
+  const pagIni = Math.max(1, Number(url.searchParams.get("pagina") ?? "1") || 1);
+  const maxPag = Math.max(1, Number(url.searchParams.get("maxpag") ?? (modo === "survey" ? "60" : "5")) || 1);
+  const t0 = Date.now();
+  const fields = await resolveFields(env);
+  const fIdPac = fields["ID Paciente CNN"];
+  const out: any = { modo, dry, pagina_ini: pagIni, paginas_lidas: 0, leads: 0, fracos: 0, com_cnn: 0, sem_cnn: 0, corrigidos: 0, sem_nome: 0, erros: 0, amostra: [] as any[], proxima_pagina: pagIni, fim: false };
+  let pag = pagIni, pagesThis = 0;
+  while (Date.now() - t0 < 250000 && pagesThis < maxPag) {
+    let r: any;
+    try { r = await kommoGet(`/leads?limit=250&with=contacts&page=${pag}`, env); }
+    catch (e) { out.erro = String(e).slice(0, 140); break; }
+    const leads = r?._embedded?.leads ?? [];
+    if (!leads.length) { out.fim = true; break; }
+    out.paginas_lidas++; pagesThis++;
+    for (const l of leads) {
+      out.leads++;
+      const leadNome = String(l.name ?? "");
+      if (!nomeFraco(leadNome)) continue; // foco no nome do lead visível ("Lead #...")
+      out.fracos++;
+      const pid = getFieldValue(l, fIdPac);
+      if (pid) out.com_cnn++; else out.sem_cnn++;
+      if (modo === "survey") {
+        if (out.amostra.length < 25) out.amostra.push({ lead: l.id, pipeline: l.pipeline_id, status: l.status_id, pid: pid ?? null, nomeLead: leadNome });
+        continue;
+      }
+      // FIX — nome real: CNN (se pid) > nome do contato (se bom)
+      let real = pid ? ((await cnnPacienteNome(String(pid), env, target))?.trim() ?? "") : "";
+      const contactId = l._embedded?.contacts?.[0]?.id ? String(l._embedded.contacts[0].id) : null;
+      let contactNome = "";
+      if (contactId) { try { const c: any = await kommoGet(`/contacts/${contactId}`, env); contactNome = String(c?.name ?? ""); } catch { /* ignore */ } }
+      if (!real && !nomeFraco(contactNome)) real = contactNome.trim();
+      if (!real) { out.sem_nome++; if (out.amostra.length < 25) out.amostra.push({ lead: l.id, pid: pid ?? null, nomeLead: leadNome, acao: "sem_nome" }); continue; }
+      const leadNomeNovo = /\(duplicata\)/i.test(leadNome) ? `${real} (duplicata)` : real; // preserva marca existente
+      if (dry) { if (out.amostra.length < 25) out.amostra.push({ lead: l.id, pid: pid ?? null, de: leadNome, para: leadNomeNovo, contato: contactNome || null }); out.corrigidos++; continue; }
+      await kommoPatch(`/leads/${l.id}`, { name: leadNomeNovo }, env);
+      if (contactId && nomeFraco(contactNome)) await kommoPatch(`/contacts/${contactId}`, { name: real }, env);
+      out.corrigidos++;
+      if (out.amostra.length < 25) out.amostra.push({ lead: l.id, para: leadNomeNovo });
+    }
+    pag++;
+    if (!r?._links?.next) { out.fim = true; break; }
+  }
+  out.proxima_pagina = pag;
+  return Response.json(out);
+}
+
 // Readers do SWEEP: teto RÍGIDO de páginas (independente do contador global subreqUsados) →
 // seguros sob concorrência (requests paralelos não se corrompem via o global). Janela futura é
 // consultada à parte (detecção confiável do Bloco Futuro, sem depender de ordenação da paginação).
@@ -5817,6 +5872,12 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
       if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
       resetSubreq();
       return handleContarLeads(req, env);
+    }
+
+    if (pathname === "/debug-nome-base") { // survey/fix do NOME na BASE INTEIRA do Kommo (pagina /leads) — read-only em survey
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      resetSubreq();
+      return handleDebugNomeBase(req, env);
     }
 
     if (pathname === "/debug-backfill-preview") {
