@@ -4120,7 +4120,7 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
       idPaciente, idPacienteConvenio,
       idTipoConsulta, idLocalAgenda,
       status: "AGENDADO",
-      procedimentos: [{ idTipoProcedimento: idTipoProc, quantidade: 1 }],
+      procedimentos: idTipoProc > 0 ? [{ idTipoProcedimento: idTipoProc, quantidade: 1 }] : [],
     }, env, target);
 
     const fields = await resolveFields(env);
