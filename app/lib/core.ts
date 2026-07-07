@@ -253,6 +253,7 @@ function cnnProducaoPermitido(method: string, path: string, status?: string): bo
     return status !== undefined && CNN_STATUS_ALTERACAO_PERMITIDOS.has(status); // NUNCA cancelar/faltar etc.
   if (m === "POST" && /^\/agenda\/\d+\/remarcar$/.test(p)) return true; // remarcar horário (webhook 3)
   if (m === "POST" && p === "/convenio-paciente/associar") return true; // pré-requisito do /agenda/novo
+  if (m === "POST" && p === "/paciente/novo") return true;              // W1/F.Captura: criar paciente do 1º contato (só o webhook lead-agendado chama)
   return false;
 }
 function assertCnnWritable(target: CnnTarget, method: string, path: string, status?: string): void {
@@ -1043,6 +1044,15 @@ function cnnLocalAgenda(env: Env, target: CnnTarget): number {
 function cnnTipoProcedimento(env: Env, target: CnnTarget): number {
   return target === "production" ? Number(env.CNN_TIPO_PROCEDIMENTO_PRODUCTION ?? 381357) : CNN_TIPO_PROCEDIMENTO;
 }
+// F.Captura (Grupo A / lead-agendado): tipo de atendimento = Consulta/Avaliação (66666) e procedimento
+// PREDEFINIDO = "Av Capilar" (361025) — o CNN exige 1 procedimento na agenda mesmo p/ consulta; não há
+// procedimento "só consulta" genérico, então usa-se esse placeholder (equipe ajusta na tela se preciso).
+function cnnTipoConsultaCaptura(env: Env, target: CnnTarget): number {
+  return target === "production" ? Number(env.CNN_TIPO_CONSULTA_PRODUCTION ?? 66666) : CNN_TIPO_CONSULTA;
+}
+function cnnProcedimentoCaptura(env: Env, target: CnnTarget): number {
+  return target === "production" ? Number(env.CNN_PROCEDIMENTO_CAPTURA_PRODUCTION ?? 361025) : CNN_TIPO_PROCEDIMENTO;
+}
 // ── Anti-loop PURO (testável no /debug-selftest): dada a intenção e o estado atual da agenda
 //    (agenda_sync, ou null), decide executar ou suprimir. NÃO toca I/O. ──
 // ⚠️ O ÚNICO guarda anti-loop é a convergência de (last_agendamento_ts ±60s, last_cnn_status).
@@ -1303,6 +1313,7 @@ async function handleLeadAgendado(req: Request, env: Env): Promise<Response> {
   const fAgendamento = fields["AGENDAMENTO"];
   if (!fIdAgenda || !fIdPaciente || !fAgendamento)
     return new Response("campos CNN não encontrados — verifique os nomes no Kommo", { status: 500 });
+  const wt = cnnWriteTarget(env); // F.Captura escreve no CNN de escrita (produção no go-live), não mais sandbox
 
   const lead = await kommoGet(`/leads/${leadId}?with=contacts`, env);
   if (getFieldValue(lead, fIdAgenda))
@@ -1327,7 +1338,7 @@ async function handleLeadAgendado(req: Request, env: Env): Promise<Response> {
   if (!idPaciente) {
     let existente: any = null;
     try {
-      const busca = await cnnGet(`/paciente/lista?nomeContem=${encodeURIComponent(nome)}&limite=5`, env);
+      const busca = await cnnGet(`/paciente/lista?nomeContem=${encodeURIComponent(nome)}&limite=5`, env, wt);
       existente = (busca?.lista ?? []).find(
         (p: any) => p.nome?.toLowerCase().trim() === nome.toLowerCase().trim()
       ) ?? null;
@@ -1338,23 +1349,23 @@ async function handleLeadAgendado(req: Request, env: Env): Promise<Response> {
       const novo = await cnnPost("/paciente/novo", {
         nome, dataNascimento,
         ...(telefone ? { contato: { telefoneCelular: normalizePhone(telefone) } } : {}),
-      }, env);
+      }, env, wt);
       idPaciente = novo.id;
     }
   }
 
   // Convênio: clínica é FULL PARTICULAR. /agenda/novo EXIGE idPacienteConvenio.
   // Associa o Particular; se o paciente já tem, reaproveita a associação existente.
-  const idPacienteConvenio = await getOrCreateConvenioParticular(idPaciente, env);
+  const idPacienteConvenio = await getOrCreateConvenioParticular(idPaciente, env, wt);
 
   const horaFim = addMinutes(hora, 30);
   const agenda = await cnnPost("/agenda/novo", {
     data, horaInicio: `${hora}:00`, horaFim: `${horaFim}:00`,
     idPaciente, idPacienteConvenio,
-    idTipoConsulta: CNN_TIPO_CONSULTA, idLocalAgenda: CNN_LOCAL_AGENDA,
+    idTipoConsulta: cnnTipoConsultaCaptura(env, wt), idLocalAgenda: cnnLocalAgenda(env, wt),
     status: "AGENDADO",
-    procedimentos: [{ idTipoProcedimento: CNN_TIPO_PROCEDIMENTO, quantidade: 1 }],
-  }, env);
+    procedimentos: [{ idTipoProcedimento: cnnProcedimentoCaptura(env, wt), quantidade: 1 }],
+  }, env, wt);
 
   await setLeadFields(leadId, [
     { id: fIdAgenda,   value: String(agenda.id) },
@@ -3522,7 +3533,7 @@ function runSelftestLogic(): SelftestResultado {
   selftestAssert(acc, "allowlist:POST /convenio-paciente/associar → permite", true, cnnProducaoPermitido("POST", "/convenio-paciente/associar"));
   selftestAssert(acc, "allowlist:query string ignorada (/agenda/novo?x=1)", true, cnnProducaoPermitido("POST", "/agenda/novo?x=1"));
   selftestAssert(acc, "allowlist:DELETE /paciente/1 → BLOQUEIA", false, cnnProducaoPermitido("DELETE", "/paciente/1"));
-  selftestAssert(acc, "allowlist:POST /paciente/novo → BLOQUEIA", false, cnnProducaoPermitido("POST", "/paciente/novo"));
+  selftestAssert(acc, "allowlist:POST /paciente/novo → permite (W1/F.Captura, 1º contato)", true, cnnProducaoPermitido("POST", "/paciente/novo"));
   selftestAssert(acc, "allowlist:POST /orcamento/novo → BLOQUEIA", false, cnnProducaoPermitido("POST", "/orcamento/novo"));
   selftestAssert(acc, "allowlist:PUT /paciente/1 → BLOQUEIA", false, cnnProducaoPermitido("PUT", "/paciente/1"));
   selftestAssert(acc, "allowlist:DELETE /agenda/1 → BLOQUEIA (nunca apaga)", false, cnnProducaoPermitido("DELETE", "/agenda/1"));
@@ -3543,6 +3554,8 @@ function runSelftestLogic(): SelftestResultado {
   selftestAssert(acc, "cfg:tipoProc produção = 381357", 381357, cnnTipoProcedimento({} as any, "production"));
   selftestAssert(acc, "cfg:tipoProc sandbox = 1011844", 1011844, cnnTipoProcedimento({} as any, "sandbox"));
   selftestAssert(acc, "cfg:localAgenda produção overridável por env", 19779, cnnLocalAgenda({ CNN_LOCAL_AGENDA_PRODUCTION: "19779" } as any, "production"));
+  selftestAssert(acc, "cfg:tipoConsultaCaptura produção = 66666 (Consulta/Avaliação)", 66666, cnnTipoConsultaCaptura({} as any, "production"));
+  selftestAssert(acc, "cfg:procedimentoCaptura produção = 361025 (Av Capilar)", 361025, cnnProcedimentoCaptura({} as any, "production"));
 
   return { mode: "logic", passed: acc.passed, failed: acc.failed, total: acc.passed + acc.failed, falhas: acc.falhas };
 }
@@ -6009,4 +6022,6 @@ interface Env {
   CNN_CONVENIO_PARTICULAR_PRODUCTION?: string;
   CNN_LOCAL_AGENDA_PRODUCTION?: string;
   CNN_TIPO_PROCEDIMENTO_PRODUCTION?: string;
+  CNN_TIPO_CONSULTA_PRODUCTION?: string;        // F.Captura (Grupo A): tipo consulta (default 66666 Consulta/Avaliação)
+  CNN_PROCEDIMENTO_CAPTURA_PRODUCTION?: string; // F.Captura: procedimento predefinido (default 361025 Av Capilar)
 }
