@@ -4139,8 +4139,8 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
     await setLeadFields(FX_LEAD, [
       { id: fields["ID Paciente CNN"], value: url.searchParams.get("pid") ?? "28524071" },
       { id: fields["ID Agenda CNN"], value: "" },
-      { id: fields["AGENDAMENTO"], value: String(ts) },
     ], env);
+    await setAgendamento(FX_LEAD, ts, fields["AGENDAMENTO"], env); // date_time exige NÚMERO (unix), não string
     // Dispara o W1 exatamente como o webhook real (form-urlencoded).
     const fakeReq = new Request("https://x/webhook/lead-agendado", { method: "POST",
       body: `leads[status][0][id]=${FX_LEAD}`, headers: { "Content-Type": "application/x-www-form-urlencoded" } });
