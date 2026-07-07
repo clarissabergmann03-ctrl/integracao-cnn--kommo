@@ -4112,6 +4112,23 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
     return Response.json(out);
   }
 
+  if (modo === "posvenda") { // exercita o fluxo REAL de pós-venda agendar (Grupo B): enfileira CNN_AGENDAR
+    // igual ao /webhook/pos-venda-agendar (mesma chave/payload/fila). O consumidor cria a agenda no CNN.
+    const pid = url.searchParams.get("pid") ?? "";
+    if (!pid) return Response.json({ erro: "faltou ?pid= (id do paciente de teste no CNN)" }, { status: 400 });
+    const data = url.searchParams.get("data") ?? tomorrowBRT();
+    const hora = url.searchParams.get("hora") ?? "12:00";
+    const tipoNome = url.searchParams.get("tipoNome") ?? "Retorno"; // → idTipoConsulta resolvido por nome no alvo
+    const ts = brtToUnix(data, hora);
+    const chave = `CNN_AGENDAR:${FX_LEAD}:${ts}`;
+    await purgarGemeoFeito(chave, env);
+    await filaEnfileirarLote([{
+      chave, tipo: "CNN_AGENDAR", paciente_id_cnn: String(pid), grupo: "B",
+      payload: { leadId: FX_LEAD, pid: String(pid), ts, tipoNome },
+    }], env);
+    return Response.json({ modo, enfileirado: "CNN_AGENDAR", chave, ts, data, hora, tipoNome, pid, lead: FX_LEAD });
+  }
+
   if (modo === "criar") {
    try {
     // ── DEDUP POR NÚMERO (telefone). id do paciente é secundário. ──
