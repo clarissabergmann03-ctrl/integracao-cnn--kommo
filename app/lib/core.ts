@@ -4029,6 +4029,7 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
   }
 
   if (modo === "criar") {
+   try {
     const pr = await fxProbe(env);
     // Reusa paciente já existente (por telefone ou por id conhecido) — nunca duplica.
     let idPaciente: number | undefined;
@@ -4075,6 +4076,9 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
     ], env);
 
     return Response.json({ modo, ok: true, criou_paciente: criou, idPaciente, idPacienteConvenio, idAgenda: agenda?.id, data, hora, lead: FX_LEAD, vinculado: true });
+   } catch (e: any) {
+    return Response.json({ modo, ok: false, erro: String(e?.message ?? e), stack: String(e?.stack ?? "").split("\n").slice(0, 4) }, { status: 500 });
+   }
   }
 
   return Response.json({ erro: "modo inválido (use probe|criar)" }, { status: 400 });
