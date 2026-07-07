@@ -4,7 +4,22 @@
 // então as queries do código legado migram quase intactas.
 import postgres from 'postgres'
 
-export const sql = postgres(process.env.DATABASE_URL!, { prepare: false })
+// Tuning p/ serverless + Supavisor (transaction mode :6543). Sem estes timeouts, uma conexão
+// que o pooler derrubou por ociosidade fica "morta" no pool do postgres.js e PENDURA a próxima
+// query até o maxDuration (60s) da Vercel → 504 sob concorrência (medido: ~96% em burst de 40).
+//  • idle_timeout: fecha conexão ociosa ANTES do Supavisor (evita reutilizar conexão morta)
+//  • max_lifetime: recicla conexões periodicamente
+//  • connect_timeout: falha rápido em vez de pendurar ao (re)conectar
+//  • max: modesto — no Fluid Compute várias invocações dividem 1 pool; evita estourar o pooler
+//  • statement_timeout: o servidor cancela query travada (libera a conexão em vez de segurar 60s)
+export const sql = postgres(process.env.DATABASE_URL!, {
+  prepare: false,
+  idle_timeout: 20,
+  max_lifetime: 60 * 30,
+  connect_timeout: 15,
+  max: 8,
+  connection: { statement_timeout: 20000 },
+})
 
 const toPg = (q: string): string => { let i = 0; return q.replace(/\?/g, () => `$${++i}`) }
 
