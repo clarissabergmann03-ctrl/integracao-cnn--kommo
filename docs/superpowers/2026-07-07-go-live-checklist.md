@@ -2,6 +2,25 @@
 **Fonte:** auditoria multi-agente `wln80bf0k` (07/07) — 4 subagentes read-only + síntese.
 **Veredito:** NO-GO condicional — fechar as travas T1/T2 + pendências P1/P2 abaixo antes de declarar GO.
 
+## ✅ PRONTIDÃO (07/07, prep executada)
+- **URL de produção estável:** `https://kommo-cnn.vercel.app` (deploy prod, pública, /health 200). É a URL dos webhooks + pg_cron.
+- **Envs de produção: OK** — WEBHOOK_SECRET, DATABASE_URL, KOMMO_ACCESS_TOKEN, KOMMO_SUBDOMAIN, CNN_WRITE_TARGET=production, WH1/WH2_ENABLED, CNN_CID/BASIC_USER/BASIC_PASS_PRODUCTION todos setados p/ `production`. `DIRECT_URL` ausente = OK (só scripts locais usam). `CNN_CONVENIO/LOCAL/TIPO_PROCEDIMENTO_PRODUCTION` ausentes → código usa defaults 27603/19775/381357 (P2: confirmar/override se a clínica quiser outra sala/proc).
+- **Smoke prod:** dry tick lê Supabase (ok, ~1s); selftest logic 64/64; /debug-audit mapeamento 1561. CNN prod + Kommo + Supabase acessíveis.
+- **P1 RESOLVIDO:** `GET /api/v4/webhooks` = 0 webhooks de conta → são ações "Enviar webhook" do Digital Pipeline/Salesbot → **re-apontar na UI do Kommo** (não há API). URLs novas: `https://kommo-cnn.vercel.app/webhook/{confirmacao,pos-venda-agendar,lead-agendado}?secret=<WEBHOOK_SECRET>`.
+- **pg_cron SQL PRONTO** (valores reais preenchidos — rodar no SQL Editor do Supabase DURANTE a janela do cutover, após pausar CF):
+```sql
+select vault.create_secret('<WEBHOOK_SECRET>',                    'kommo_cnn_webhook_secret');
+select vault.create_secret('https://kommo-cnn.vercel.app/api/tick','kommo_cnn_tick_url');
+select cron.schedule('kommo-cnn-tick', '* * * * *', $$
+  select net.http_post(
+    url     := (select decrypted_secret from vault.decrypted_secrets where name='kommo_cnn_tick_url'),
+    headers := jsonb_build_object('Content-Type','application/json',
+                 'Authorization',(select decrypted_secret from vault.decrypted_secrets where name='kommo_cnn_webhook_secret')),
+    body    := '{}'::jsonb, timeout_milliseconds := 55000);
+$$);
+```
+- **FALTA p/ o GO:** P2 (confirmar sala/proc ou aceitar defaults) + a **janela coordenada do cutover** (eu: pausar CF → re-resync → rodar pg_cron; VOCÊ: trocar os webhooks na UI; ambos observam ~10min).
+
 ---
 
 ## Estado da validação (o que já está provado e2e)
