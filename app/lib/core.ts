@@ -3990,6 +3990,95 @@ async function handleDebugCount(env: Env): Promise<Response> {
 // ── Debug: cria uma agenda de teste no SANDBOX com tipo escolhido ─────────────
 // Só sandbox + allowlist. Usado pra testar o roteamento da Função 2 E2E, já que
 // os tipos do sandbox ("Encaixe"/"Cirurgia") são os únicos que casam com grupo.
+// ── FIXTURE DE TESTE (produção) — cria/vincula o paciente de teste dedicado ────
+// Escopo TRAVADO ao telefone/lead de teste (11946800329 / lead 17488447). Autorizado
+// explicitamente pelo dono (06/07) só para montar o fixture de validação em produção.
+// ?modo=probe (read-only) confirma existência; ?modo=criar cria (se faltar) + agenda + vincula.
+// Guardrail PRESERVADO: jamais DELETE, jamais alterar/deletar paciente. Criar paciente é a
+// ÚNICA exceção autorizada ao allowlist §7.8, feita por fetch direto e SÓ para o telefone de teste.
+const FX_PHONE = "11946800329";
+const FX_LEAD  = "17488447";
+const FX_NOME  = "TESTE INTEGRACAO KOMMO";
+const FX_IDS_CONHECIDOS = ["28155333", "28146949"]; // resíduo dos custom fields do lead
+async function fxProbe(env: Env): Promise<any> {
+  const target: CnnTarget = "production";
+  const porId: any[] = [];
+  for (const id of FX_IDS_CONHECIDOS) {
+    try { const p: any = await cnnGet(`/paciente/${id}`, env, target);
+      porId.push({ id, existe: !!p?.nome, nome: p?.nome ?? null, telefone: p?.telefoneCelular ?? p?.contato?.telefoneCelular ?? null, ativo: p?.ativo ?? null }); }
+    catch (e) { porId.push({ id, existe: false, erro: String(e) }); }
+  }
+  let porFone: any = null;
+  try { const r: any = await cnnGet(`/paciente/lista?telefoneCelularContem=${FX_PHONE}&limite=10`, env, target);
+    porFone = (r?.lista ?? []).map((p: any) => ({ id: p.id, nome: p.nome, telefone: p.telefoneCelular ?? p.contato?.telefoneCelular ?? null, ativo: p.ativo })); }
+  catch (e) { porFone = { erro: String(e) }; }
+  let porNome: any = null;
+  try { const r: any = await cnnGet(`/paciente/lista?nomeContem=${encodeURIComponent(FX_NOME)}&limite=10`, env, target);
+    porNome = (r?.lista ?? []).map((p: any) => ({ id: p.id, nome: p.nome, telefone: p.telefoneCelular ?? null })); }
+  catch (e) { porNome = { erro: String(e) }; }
+  return { porId, porFone, porNome };
+}
+async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response> {
+  resetSubreq();
+  const url = new URL(req.url);
+  const modo = url.searchParams.get("modo") ?? "probe";
+  const target: CnnTarget = "production";
+
+  if (modo === "probe") {
+    return Response.json({ modo, target, phone: FX_PHONE, lead: FX_LEAD, ...(await fxProbe(env)) });
+  }
+
+  if (modo === "criar") {
+    const pr = await fxProbe(env);
+    // Reusa paciente já existente (por telefone ou por id conhecido) — nunca duplica.
+    let idPaciente: number | undefined;
+    const foneHit = Array.isArray(pr.porFone)
+      ? pr.porFone.find((p: any) => String(p.telefone ?? "").replace(/\D/g, "").endsWith(FX_PHONE)) : null;
+    const idHit = pr.porId.find((p: any) => p.existe);
+    if (foneHit) idPaciente = Number(foneHit.id);
+    else if (idHit) idPaciente = Number(idHit.id);
+
+    let criou = false;
+    if (!idPaciente) {
+      // ÚNICA exceção autorizada ao §7.8: POST /paciente/novo p/ o paciente de teste.
+      // fetch direto (não passa por cnnPost/assertCnnWritable) → guardrail global segue intacto p/ todo o resto.
+      const body = { nome: FX_NOME, dataNascimento: "1900-01-01", contato: { telefoneCelular: normalizePhone(FX_PHONE) } };
+      const res = await fetchComRetry(() => { bumpSubreq(); return fetch(`${CNN_BASE}/paciente/novo`, {
+        method: "POST", headers: cnnHeaders(env, target), body: JSON.stringify(body),
+      }); }, retryPost());
+      const text = await res.text();
+      if (!res.ok) return Response.json({ modo, erro: `POST /paciente/novo → ${res.status}: ${text}` }, { status: 502 });
+      const novo = text ? JSON.parse(text) : null;
+      idPaciente = Number(novo?.id);
+      criou = true;
+    }
+    if (!idPaciente) return Response.json({ modo, erro: "sem idPaciente após criar/buscar", probe: pr }, { status: 500 });
+
+    const idPacienteConvenio = await getOrCreateConvenioParticular(idPaciente, env, target);
+    const data = url.searchParams.get("data") ?? tomorrowBRT();
+    const hora = url.searchParams.get("hora") ?? "10:00";
+    const horaFim = addMinutes(hora, 30);
+    const agenda: any = await cnnPost("/agenda/novo", {
+      data, horaInicio: `${hora}:00`, horaFim: `${horaFim}:00`,
+      idPaciente, idPacienteConvenio,
+      idTipoConsulta: CNN_TIPO_CONSULTA, idLocalAgenda: CNN_LOCAL_AGENDA,
+      status: "AGENDADO",
+      procedimentos: [{ idTipoProcedimento: CNN_TIPO_PROCEDIMENTO, quantidade: 1 }],
+    }, env, target);
+
+    // Vincula ao card do Kommo (lead de teste).
+    const fields = await resolveFields(env);
+    await setLeadFields(FX_LEAD, [
+      { id: fields["ID Agenda CNN"],   value: String(agenda.id) },
+      { id: fields["ID Paciente CNN"], value: String(idPaciente) },
+    ], env);
+
+    return Response.json({ modo, ok: true, criou_paciente: criou, idPaciente, idPacienteConvenio, idAgenda: agenda?.id, data, hora, lead: FX_LEAD, vinculado: true });
+  }
+
+  return Response.json({ erro: "modo inválido (use probe|criar)" }, { status: 400 });
+}
+
 async function handleDebugCriarAgenda(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
   const telefone = normalizePhone(url.searchParams.get("phone") ?? "11946800329");
@@ -5270,6 +5359,11 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
     if (pathname === "/debug-criar-agenda") {
       if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
       return handleDebugCriarAgenda(req, env);
+    }
+
+    if (pathname === "/debug-fixture-teste") { // monta o paciente/agenda de teste em produção (escopo travado)
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      return handleDebugFixtureTeste(req, env);
     }
 
     if (pathname === "/debug-move") {
