@@ -5771,7 +5771,7 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
       return handleDebugNome(req, env);
     }
 
-    if (pathname === "/debug-audit") { // AUDITORIA read-only: classificador da migração vs Kommo (etapa/inativo/valor/duplicata)
+    if (pathname === "/debug-auditoria") { // AUDITORIA read-only: classificador da migração vs Kommo (etapa/inativo/valor/duplicata)
       if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
       resetSubreq();
       return handleDebugAudit(req, env);
