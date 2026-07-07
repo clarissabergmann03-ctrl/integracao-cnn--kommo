@@ -385,6 +385,11 @@ function getFieldValue(entity: any, fieldId: number): string | null {
   return (entity.custom_fields_values ?? [])
     .find((f: any) => f.field_id === fieldId)?.values?.[0]?.value ?? null;
 }
+// Todos os valores de um campo MULTISELECT (Corporais/Faciais podem ter várias opções por card).
+function getFieldValuesMulti(entity: any, fieldId: number): string[] {
+  const f = (entity.custom_fields_values ?? []).find((x: any) => x.field_id === fieldId);
+  return (f?.values ?? []).map((v: any) => String(v.value)).filter(Boolean);
+}
 async function setLeadFields(leadId: string, updates: Array<{ id: number; value?: string; enumId?: number }>, env: Env) {
   await kommoPatch(`/leads/${leadId}`, {
     custom_fields_values: updates.map(u => ({
@@ -1019,6 +1024,25 @@ function tipoProcedimentoParaId(valorOpcao: string | null): number {
   if (!valorOpcao) return 0;
   return TIPO_PROCEDIMENTO_CNN[valorOpcao.toLowerCase().trim()] ?? 0;
 }
+// Correlação (confirmada pelo dono 07/07): opção dos campos Kommo "Corporais"/"Faciais" → idTipoProcedimento
+// do CNN (avaliação "Av X"). Opções SEM correspondente NÃO entram aqui → o WH2 NÃO cria agenda (equipe agenda
+// no CNN manual). Sem correspondente hoje: Lipedema, Cisto Sebáceo, Lipoma, Biópsia, Papada, Bioestimuladores,
+// Preen. Labial, Rino modelação, Siringoma, Xantelasma, Lifting de Sobran., Lobuloplastia.
+const PROCEDIMENTO_CNN_POR_OPCAO: Record<string, number> = {
+  // Corporais
+  "celulite": 381386, "depilação a laser": 381362, "escleroterapia": 381389, "emagrecimento": 381360,
+  "gordura localizada": 381392, "remoção de tatuagem": 381405, "flacidez corporal": 381391,
+  "unha encravada": 381384, "onicomicose": 381398, "sinais de pele": 381406, "câncer de pele": 381383,
+  "cicatriz": 381402,
+  // Faciais
+  "botox": 381357, "h. fac. / preen. / rejuv.": 381403, "peeling": 381400, "olheiras / bléfaro": 381397,
+  "acne": 381381, "melasma / mela. solar": 381395, "despig. de sobran.": 381396,
+};
+function procedimentosCnnDoCard(opcoes: string[]): number[] {
+  const ids: number[] = [];
+  for (const o of opcoes) { const id = PROCEDIMENTO_CNN_POR_OPCAO[(o ?? "").toLowerCase().trim()]; if (id && !ids.includes(id)) ids.push(id); }
+  return ids;
+}
 // Resolve o NOME do tipo → idTipoConsulta REAL do ambiente-alvo (via /tipo-consulta/lista, cacheado).
 // Robusto entre sandbox/prod e a renumeração do CNN. null se o tipo não existir no alvo.
 async function resolveTipoConsultaId(nome: string, env: Env, target: CnnTarget): Promise<number | null> {
@@ -1202,7 +1226,7 @@ async function consumirItemCnnAgendar(item: any, env: Env, dryRun: boolean): Pro
     data, horaInicio: `${hora}:00`, horaFim: `${horaFim}:00`,
     idPaciente: Number(pid), idPacienteConvenio,
     idTipoConsulta, idLocalAgenda: cnnLocalAgenda(env, wt), status: "AGENDADO",
-    procedimentos: [{ idTipoProcedimento: cnnTipoProcedimento(env, wt), quantidade: 1 }],
+    procedimentos: (Array.isArray(p.procIds) && p.procIds.length ? p.procIds : [cnnTipoProcedimento(env, wt)]).map((id: number) => ({ idTipoProcedimento: id, quantidade: 1 })),
   }, env, wt);
   // Marcador durável ANTES de tocar o card (achados B/#9): se o PATCH do card falhar, o retry
   // encontra a agenda via agenda_sync (barreira 1) e NÃO cria outra.
@@ -1435,8 +1459,12 @@ async function handlePosVendaAgendar(req: Request, env: Env): Promise<Response> 
   const pid = getFieldValue(lead, fields["ID Paciente CNN"]);
   const ts = Number(getFieldValue(lead, fields["AGENDAMENTO"]) ?? 0);
   const tipoNome = getFieldValue(lead, fields["Tipo Procedimento CNN"]) ?? "";
+  // Procedimento(s) do card (Corporais + Faciais, multiselect) → ids CNN correlacionados (dono 07/07).
+  const opcoesProc = [...getFieldValuesMulti(lead, fields["Corporais"]), ...getFieldValuesMulti(lead, fields["Faciais"])];
+  const procIds = procedimentosCnnDoCard(opcoesProc);
   if (!pid) return Response.json({ ok: true, skipped: "sem ID Paciente CNN (não cria paciente)" });
   if (!ts || tipoProcedimentoParaId(tipoNome) === 0) return Response.json({ ok: true, skipped: "sem AGENDAMENTO ou Tipo Procedimento CNN" });
+  if (!procIds.length) return Response.json({ ok: true, skipped: "sem procedimento correspondente no CNN — equipe agenda manual", opcoes: opcoesProc });
   if (await leadEhFamilia(leadId, env)) {
     if (!dry) await audit(env, { funcao: "CNN_AGENDAR", ambiente: "kommo", entidade_id: leadId, acao: "recusado_familia" });
     return Response.json({ ok: true, dry, recusado: "familia" });
@@ -1453,7 +1481,7 @@ async function handlePosVendaAgendar(req: Request, env: Env): Promise<Response> 
   await purgarGemeoFeito(chave, env); // achado A: libera re-disparo legítimo (cancelar+reagendar mesmo horário)
   await filaEnfileirarLote([{
     chave, tipo: "CNN_AGENDAR", paciente_id_cnn: String(pid), grupo: "B",
-    payload: { leadId, pid: String(pid), ts, tipoNome },
+    payload: { leadId, pid: String(pid), ts, tipoNome, procIds },
   }], env);
   return Response.json({ ok: true, enfileirado: "CNN_AGENDAR" });
 }
@@ -3556,6 +3584,12 @@ function runSelftestLogic(): SelftestResultado {
   selftestAssert(acc, "cfg:localAgenda produção overridável por env", 19779, cnnLocalAgenda({ CNN_LOCAL_AGENDA_PRODUCTION: "19779" } as any, "production"));
   selftestAssert(acc, "cfg:tipoConsultaCaptura produção = 66666 (Consulta/Avaliação)", 66666, cnnTipoConsultaCaptura({} as any, "production"));
   selftestAssert(acc, "cfg:procedimentoCaptura produção = 361025 (Av Capilar)", 361025, cnnProcedimentoCaptura({} as any, "production"));
+  // ── correlação WH2: opção do card → procedimento CNN ──
+  selftestAssert(acc, "corr:Celulite → Av Celulite 381386", 381386, procedimentosCnnDoCard(["Celulite"])[0] ?? 0);
+  selftestAssert(acc, "corr:Botox → Av Botox 381357", 381357, procedimentosCnnDoCard(["Botox"])[0] ?? 0);
+  selftestAssert(acc, "corr:Olheiras / Bléfaro → Av Olheiras 381397", 381397, procedimentosCnnDoCard(["Olheiras / Bléfaro"])[0] ?? 0);
+  selftestAssert(acc, "corr:sem match (Lipedema) → vazio", 0, procedimentosCnnDoCard(["Lipedema"]).length);
+  selftestAssert(acc, "corr:multi (Celulite+Botox) → 2 ids", 2, procedimentosCnnDoCard(["Celulite", "Botox"]).length);
 
   return { mode: "logic", passed: acc.passed, failed: acc.failed, total: acc.passed + acc.failed, falhas: acc.falhas };
 }
