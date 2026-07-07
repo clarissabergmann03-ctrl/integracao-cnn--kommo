@@ -716,7 +716,7 @@ async function filaMarcarErro(id: number, tentativasApos: number, msg: string, e
 // Adiado (NÃO é falha: ex. ORC esperando etapa assentada): volta a 'pendente' e DESFAZ o
 // incremento do claim, p/ não queimar tentativas nem virar dead-letter à toa.
 async function filaAdiar(id: number, env: Env): Promise<void> {
-  await env.DB.prepare(`UPDATE fila_trabalho SET status='pendente', tentativas=MAX(tentativas-1,0), locked_at=NULL, atualizado_em=? WHERE id=?`)
+  await env.DB.prepare(`UPDATE fila_trabalho SET status='pendente', tentativas=GREATEST(tentativas-1,0), locked_at=NULL, atualizado_em=? WHERE id=?`)
     .bind(Math.floor(Date.now() / 1000), id).run();
 }
 async function filaStats(env: Env): Promise<Record<string, number>> {
@@ -4754,7 +4754,7 @@ async function produzirBackfillHist(env: Env, target: CnnTarget, cursorPag: numb
   }
   const stmts = [...acc.entries()].map(([pid, v]) => env.DB.prepare(
     `INSERT INTO backfill_hist (paciente_id_cnn,tem_a,tem_b,tem_futuro,agenda_futura,telefone,atualizado_em) VALUES (?,?,?,?,?,?,?)
-     ON CONFLICT(paciente_id_cnn) DO UPDATE SET tem_a=MAX(tem_a,excluded.tem_a), tem_b=MAX(tem_b,excluded.tem_b), tem_futuro=MAX(tem_futuro,excluded.tem_futuro), agenda_futura=COALESCE(agenda_futura,excluded.agenda_futura), telefone=COALESCE(NULLIF(telefone,''),excluded.telefone)`,
+     ON CONFLICT(paciente_id_cnn) DO UPDATE SET tem_a=GREATEST(tem_a,excluded.tem_a), tem_b=GREATEST(tem_b,excluded.tem_b), tem_futuro=GREATEST(tem_futuro,excluded.tem_futuro), agenda_futura=COALESCE(agenda_futura,excluded.agenda_futura), telefone=COALESCE(NULLIF(telefone,''),excluded.telefone)`,
   ).bind(pid, v.a, v.b, v.fut, v.agFut, v.tel, hojeTs));
   for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
   await setCursor("backfill_hist_pag", String(pag), env);
