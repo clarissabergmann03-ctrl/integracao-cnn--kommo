@@ -5206,6 +5206,77 @@ async function handleMigProbe(req: Request, env: Env): Promise<Response> {
   return Response.json({ pid, target, sinais, alvo, kommo_atual: kommoAtual, detalhe, subreq_usados: subreqUsados });
 }
 
+// ══ /debug-audit — AUDITORIA READ-ONLY da base: re-roda o classificador da migração no estado
+// ATUAL do CNN e compara com o Kommo por dimensão (etapa, Inativo, valor, duplicatas). NÃO ESCREVE
+// NADA. Reusa a MESMA regra acordada (derivarSinaisMig + classificarMigracao). 1 auditoria por
+// PACIENTE (não por card). Paginado (offset/limite) + time-bound 45s (cabe no limite Vercel).
+// Uso: /debug-audit?env=production&offset=0&limite=10   → varrer em passagens seguindo proximo_offset.
+async function handleDebugAudit(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const target: CnnTarget = url.searchParams.get("env") === "production" ? "production" : "sandbox";
+  const offset = Math.max(0, Number(url.searchParams.get("offset") ?? "0") || 0);
+  const limite = Math.min(40, Math.max(1, Number(url.searchParams.get("limite") ?? "10") || 10));
+  const t0 = Date.now();
+  const fields = await resolveFields(env);
+  const fIdPac = fields["ID Paciente CNN"];
+  const fInativo = fields["Inativo"];
+  const tiposMap = await resolveTiposConsulta(env, target);
+
+  const rows = ((await env.DB.prepare(
+    "SELECT DISTINCT paciente_id_cnn FROM mapeamento WHERE lead_id_kommo IS NOT NULL AND lead_id_kommo <> '' ORDER BY paciente_id_cnn LIMIT ? OFFSET ?"
+  ).bind(limite, offset).all()).results ?? []) as any[];
+
+  const out: any = {
+    target, offset, limite, examinados: 0,
+    div_etapa: 0, div_inativo: 0, div_valor: 0, div_duplicata: 0, sem_card_alvo: 0, erro_leitura: 0, erros: 0, ok: 0,
+    amostra: [] as any[], proximo_offset: offset, fim: false,
+  };
+
+  for (const r of rows) {
+    if (Date.now() - t0 > 45000) { out.parou_tempo = true; break; }
+    const pid = String(r.paciente_id_cnn);
+    out.examinados++;
+    resetSubreq(); // orçamento de leitura por-paciente (mig funcs usam orcamentoOk); na Vercel não há teto real
+    try {
+      const sweep = await migAgendasSweep(pid, env, target);
+      if (!sweep.ok) { out.erro_leitura++; continue; }
+      const orcs = await migOrcamentosPaciente(pid, env, target);
+      const { sinais, detalhe } = derivarSinaisMig(sweep.agendas, orcs, tiposMap);
+      const alvo = classificarMigracao(sinais);
+      const inativoAlvo = faixaInativo(sinais.diasSilencio);
+      const aprovados = (detalhe.orcamentos_resumo ?? []).filter((o: any) => o.status === "APROVADO");
+      const valorAlvo = aprovados.length ? Math.round(Number(aprovados[aprovados.length - 1].valor ?? 0)) : 0;
+
+      const raw: any = await kommoGet(`/leads?query=${encodeURIComponent(pid)}&limit=250`, env);
+      const cards = (raw._embedded?.leads ?? []).filter((l: any) => getFieldValue(l, fIdPac) === pid);
+
+      const divs: string[] = [];
+      const porPipe: Record<string, number> = {};
+      for (const c of cards) porPipe[String(c.pipeline_id)] = (porPipe[String(c.pipeline_id)] ?? 0) + 1;
+      if (Object.values(porPipe).some((n) => n > 1) || cards.length > 2) { out.div_duplicata++; divs.push("duplicata"); }
+
+      const cardAlvo = cards.find((c: any) => Number(c.pipeline_id) === alvo.pipeline);
+      if (!cardAlvo) { out.sem_card_alvo++; divs.push("sem_card_alvo"); }
+      else {
+        if (Number(cardAlvo.status_id) !== alvo.stage) { out.div_etapa++; divs.push("etapa"); }
+        const inativoAtual = fInativo ? String(getFieldValue(cardAlvo, fInativo) ?? "") : "";
+        if ((inativoAtual || "").trim() !== (inativoAlvo || "").trim()) { out.div_inativo++; divs.push("inativo"); }
+        const priceAtual = Math.round(Number(cardAlvo.price ?? 0));
+        if (valorAlvo > 0 && priceAtual !== valorAlvo) { out.div_valor++; divs.push("valor"); }
+      }
+      if (!divs.length) { out.ok++; continue; }
+      if (out.amostra.length < 25) out.amostra.push({
+        pid, divs, regra: alvo.regra,
+        alvo: { pipeline: alvo.pipeline, stage: alvo.stage, inativo: inativoAlvo, valor: valorAlvo, silencio: sinais.diasSilencio, temFutura: sinais.temAgendaFutura },
+        cards: cards.map((c: any) => ({ lead: c.id, pipeline: c.pipeline_id, stage: c.status_id, price: c.price ?? 0, inativo: fInativo ? getFieldValue(c, fInativo) : null, nome: c.name })),
+      });
+    } catch (e) { out.erros++; if (out.amostra.length < 25) out.amostra.push({ pid, erro: String(e).slice(0, 160) }); }
+  }
+  out.proximo_offset = offset + out.examinados;
+  out.fim = !out.parou_tempo && rows.length < limite;
+  return Response.json(out);
+}
+
 // Readers do SWEEP: teto RÍGIDO de páginas (independente do contador global subreqUsados) →
 // seguros sob concorrência (requests paralelos não se corrompem via o global). Janela futura é
 // consultada à parte (detecção confiável do Bloco Futuro, sem depender de ordenação da paginação).
@@ -5698,6 +5769,12 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
       if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
       resetSubreq();
       return handleDebugNome(req, env);
+    }
+
+    if (pathname === "/debug-audit") { // AUDITORIA read-only: classificador da migração vs Kommo (etapa/inativo/valor/duplicata)
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      resetSubreq();
+      return handleDebugAudit(req, env);
     }
 
     if (pathname === "/debug-backfill-preview") {
