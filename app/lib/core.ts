@@ -4000,23 +4000,25 @@ const FX_PHONE = "11946800329";
 const FX_LEAD  = "17488447";
 const FX_NOME  = "TESTE INTEGRACAO KOMMO";
 const FX_IDS_CONHECIDOS = ["28155333", "28146949"]; // resíduo dos custom fields do lead
-async function fxProbe(env: Env): Promise<any> {
-  const target: CnnTarget = "production";
-  const porId: any[] = [];
-  for (const id of FX_IDS_CONHECIDOS) {
-    try { const p: any = await cnnGet(`/paciente/${id}`, env, target);
-      porId.push({ id, existe: !!p?.nome, nome: p?.nome ?? null, telefone: p?.telefoneCelular ?? p?.contato?.telefoneCelular ?? null, ativo: p?.ativo ?? null }); }
-    catch (e) { porId.push({ id, existe: false, erro: String(e) }); }
-  }
-  let porFone: any = null;
-  try { const r: any = await cnnGet(`/paciente/lista?telefoneCelularContem=${FX_PHONE}&limite=10`, env, target);
-    porFone = (r?.lista ?? []).map((p: any) => ({ id: p.id, nome: p.nome, telefone: p.telefoneCelular ?? p.contato?.telefoneCelular ?? null, ativo: p.ativo })); }
-  catch (e) { porFone = { erro: String(e) }; }
-  let porNome: any = null;
-  try { const r: any = await cnnGet(`/paciente/lista?nomeContem=${encodeURIComponent(FX_NOME)}&limite=10`, env, target);
-    porNome = (r?.lista ?? []).map((p: any) => ({ id: p.id, nome: p.nome, telefone: p.telefoneCelular ?? null })); }
-  catch (e) { porNome = { erro: String(e) }; }
-  return { porId, porFone, porNome };
+// Telefone canônico p/ CASAR por número (dedup): só dígitos, ignora DDI 55 e o 9º dígito.
+function fxTelKey(p: string): string {
+  let d = (p ?? "").replace(/\D/g, "");
+  if (d.startsWith("55") && d.length >= 12) d = d.slice(2);
+  if (d.length >= 10) return d.slice(0, 2) + d.slice(2).slice(-8);
+  return d.slice(-8);
+}
+// nomeContem FUNCIONA no CNN (telefoneCelularContem é ignorado) → busca candidatos por nome.
+async function fxBuscaNome(env: Env, nome: string): Promise<any[]> {
+  try { const r: any = await cnnGet(`/paciente/lista?nomeContem=${encodeURIComponent(nome)}&limite=50`, env, "production");
+    return (r?.lista ?? []); } catch { return []; }
+}
+// Detalhe do paciente (GET /paciente/{id}) — expõe o telefone REALMENTE armazenado.
+async function fxDetalhe(env: Env, id: string | number): Promise<any> {
+  try { const p: any = await cnnGet(`/paciente/${id}`, env, "production");
+    return { id, existe: !!p?.nome, nome: p?.nome ?? null,
+      telefone: p?.telefoneCelular ?? p?.contato?.telefoneCelular ?? p?.telefone ?? null,
+      cpf: p?.cpf ?? p?.cpfCnpj ?? null, keys: Object.keys(p ?? {}) }; }
+  catch (e) { return { id, existe: false, erro: String(e) }; }
 }
 async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response> {
   resetSubreq();
@@ -4024,39 +4026,73 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
   const modo = url.searchParams.get("modo") ?? "probe";
   const target: CnnTarget = "production";
 
+  const nome = url.searchParams.get("nome") ?? FX_NOME;
+  const foneRaw = url.searchParams.get("fone") ?? FX_PHONE;
+  const foneAlvo = fxTelKey(foneRaw);
+
   if (modo === "probe") {
-    return Response.json({ modo, target, phone: FX_PHONE, lead: FX_LEAD, ...(await fxProbe(env)) });
+    const cands = await fxBuscaNome(env, nome);
+    const detalhados: any[] = [];
+    for (const c of cands.slice(0, 12)) detalhados.push(await fxDetalhe(env, c.id));
+    const matchFone = detalhados.filter((d) => fxTelKey(String(d.telefone ?? "")) === foneAlvo);
+    const porId: any[] = [];
+    for (const id of FX_IDS_CONHECIDOS) porId.push(await fxDetalhe(env, id));
+    return Response.json({ modo, target, phone: FX_PHONE, foneAlvo, lead: FX_LEAD, nome,
+      porNome_total: cands.length, detalhados, matchFone_ids: matchFone.map((d) => d.id), porId });
+  }
+
+  if (modo === "convenios") { // read-only: convênios de um paciente → descobrir idTipoConvenio "Particular" de PRODUÇÃO
+    const pid = url.searchParams.get("pid") ?? "";
+    if (!pid) return Response.json({ erro: "faltou ?pid=" }, { status: 400 });
+    try { const r: any = await cnnGet(`/convenio-paciente/lista?idPaciente=${pid}&somenteAtivos=false`, env, target);
+      return Response.json({ modo, pid, lista: r?.lista ?? r }); }
+    catch (e: any) { return Response.json({ modo, pid, erro: String(e?.message ?? e) }, { status: 502 }); }
   }
 
   if (modo === "criar") {
    try {
-    const pr = await fxProbe(env);
-    // Reusa paciente já existente (por telefone ou por id conhecido) — nunca duplica.
+    // ── DEDUP POR NÚMERO (telefone). id do paciente é secundário. ──
+    // Busca candidatos por nome (nomeContem funciona) e CONFIRMA pelo telefone canônico.
+    const cands = await fxBuscaNome(env, nome);
     let idPaciente: number | undefined;
-    const foneHit = Array.isArray(pr.porFone)
-      ? pr.porFone.find((p: any) => String(p.telefone ?? "").replace(/\D/g, "").endsWith(FX_PHONE)) : null;
-    const idHit = pr.porId.find((p: any) => p.existe);
-    if (foneHit) idPaciente = Number(foneHit.id);
-    else if (idHit) idPaciente = Number(idHit.id);
+    const casados: any[] = [];
+    for (const c of cands) {
+      const det = await fxDetalhe(env, c.id);
+      if (fxTelKey(String(det.telefone ?? "")) === foneAlvo) casados.push(c.id);
+    }
+    if (casados.length) idPaciente = Number(casados[0]);
 
     let criou = false;
     if (!idPaciente) {
-      // ÚNICA exceção autorizada ao §7.8: POST /paciente/novo p/ o paciente de teste.
-      // fetch direto (não passa por cnnPost/assertCnnWritable) → guardrail global segue intacto p/ todo o resto.
-      const nome = url.searchParams.get("nome") ?? FX_NOME;
-      const body = { nome, dataNascimento: "1900-01-01", contato: { telefoneCelular: normalizePhone(FX_PHONE) } };
+      if (url.searchParams.get("forcar") !== "1")
+        return Response.json({ modo, ok: false, motivo: "nenhum paciente com esse TELEFONE — p/ criar um novo passe &forcar=1", nome, foneAlvo, candidatos_por_nome: cands.map((c: any) => c.id) }, { status: 409 });
+      // ÚNICA exceção autorizada ao §7.8: POST /paciente/novo p/ o paciente de teste (fetch direto; guardrail global intacto).
+      const tel = normalizePhone(foneRaw);
+      const body: any = { nome, dataNascimento: "1900-01-01", telefoneCelular: tel, contato: { telefoneCelular: tel } };
       const res = await fetchComRetry(() => { bumpSubreq(); return fetch(`${CNN_BASE}/paciente/novo`, {
         method: "POST", headers: cnnHeaders(env, target), body: JSON.stringify(body),
       }); }, retryPost());
       const text = await res.text();
       if (!res.ok) return Response.json({ modo, erro: `POST /paciente/novo → ${res.status}: ${text}` }, { status: 502 });
-      const novo = text ? JSON.parse(text) : null;
-      idPaciente = Number(novo?.id);
+      idPaciente = Number((text ? JSON.parse(text) : {})?.id);
       criou = true;
     }
-    if (!idPaciente) return Response.json({ modo, erro: "sem idPaciente após criar/buscar", probe: pr }, { status: 500 });
+    if (!idPaciente) return Response.json({ modo, erro: "sem idPaciente" }, { status: 500 });
 
-    const idPacienteConvenio = await getOrCreateConvenioParticular(idPaciente, env, target);
+    // Convênio: idTipoConvenio de PRODUÇÃO via ?convenio= (senão a constante, que pode ser sandbox).
+    const idTipoConv = Number(url.searchParams.get("convenio") ?? CNN_CONVENIO_PARTICULAR);
+    let idPacienteConvenio: number | undefined; const convDetalhe: any = {};
+    try { const a: any = await cnnPost("/convenio-paciente/associar", { idPaciente, idTipoConvenio: idTipoConv }, env, target); idPacienteConvenio = a?.id; convDetalhe.assoc = a; }
+    catch (e: any) { convDetalhe.assoc_erro = String(e?.message ?? e); }
+    if (!idPacienteConvenio) {
+      try { const l: any = await cnnGet(`/convenio-paciente/lista?idPaciente=${idPaciente}&somenteAtivos=false`, env, target);
+        const it = l?.lista ?? []; convDetalhe.lista = it;
+        idPacienteConvenio = (it.find((c: any) => c.idTipoConvenio === idTipoConv) ?? it[0])?.id; }
+      catch (e: any) { convDetalhe.lista_erro = String(e?.message ?? e); }
+    }
+    if (!idPacienteConvenio)
+      return Response.json({ modo, ok: false, idPaciente, criou, motivo: "sem idPacienteConvenio — rode ?modo=convenios&pid=<paciente_real> p/ achar o idTipoConvenio de produção e passe &convenio=", convDetalhe }, { status: 422 });
+
     const data = url.searchParams.get("data") ?? tomorrowBRT();
     const hora = url.searchParams.get("hora") ?? "10:00";
     const horaFim = addMinutes(hora, 30);
@@ -4068,20 +4104,19 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
       procedimentos: [{ idTipoProcedimento: CNN_TIPO_PROCEDIMENTO, quantidade: 1 }],
     }, env, target);
 
-    // Vincula ao card do Kommo (lead de teste).
     const fields = await resolveFields(env);
     await setLeadFields(FX_LEAD, [
       { id: fields["ID Agenda CNN"],   value: String(agenda.id) },
       { id: fields["ID Paciente CNN"], value: String(idPaciente) },
     ], env);
 
-    return Response.json({ modo, ok: true, criou_paciente: criou, idPaciente, idPacienteConvenio, idAgenda: agenda?.id, data, hora, lead: FX_LEAD, vinculado: true });
+    return Response.json({ modo, ok: true, criou_paciente: criou, idPaciente, idTipoConvenio: idTipoConv, idPacienteConvenio, idAgenda: agenda?.id, data, hora, lead: FX_LEAD, vinculado: true });
    } catch (e: any) {
     return Response.json({ modo, ok: false, erro: String(e?.message ?? e), stack: String(e?.stack ?? "").split("\n").slice(0, 4) }, { status: 500 });
    }
   }
 
-  return Response.json({ erro: "modo inválido (use probe|criar)" }, { status: 400 });
+  return Response.json({ erro: "modo inválido (use probe|convenios|criar)" }, { status: 400 });
 }
 
 async function handleDebugCriarAgenda(req: Request, env: Env): Promise<Response> {
