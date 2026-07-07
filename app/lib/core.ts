@@ -5280,6 +5280,39 @@ async function handleDebugAudit(req: Request, env: Env): Promise<Response> {
   return Response.json(out);
 }
 
+// ══ /debug-contar-leads — conta TODOS os leads do Kommo (inclui GANHO/PERDIDO), por pipeline e status,
+// e quantos têm ID Paciente CNN (vínculo) vs não. READ-ONLY. Pagina por ?pagina= (250/pág), time-bound.
+// Mede a lacuna: o mapeamento só tem leads ligados a paciente CNN; leads sem vínculo ou fechados
+// podem existir no Kommo e não aparecer nas outras varreduras.
+async function handleContarLeads(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const pagIni = Math.max(1, Number(url.searchParams.get("pagina") ?? "1") || 1);
+  const t0 = Date.now();
+  const fields = await resolveFields(env);
+  const fIdPac = fields["ID Paciente CNN"];
+  const out: any = { pagina_ini: pagIni, paginas_lidas: 0, leads: 0, com_cnn: 0, sem_cnn: 0, por_pipeline: {} as any, por_status: {} as any, proxima_pagina: pagIni, fim: false };
+  let pag = pagIni;
+  while (Date.now() - t0 < 250000) {
+    let r: any;
+    try { r = await kommoGet(`/leads?limit=250&page=${pag}`, env); }
+    catch (e) { out.erro = String(e).slice(0, 140); break; }
+    const leads = r?._embedded?.leads ?? [];
+    if (!leads.length) { out.fim = true; break; }
+    out.paginas_lidas++;
+    for (const l of leads) {
+      out.leads++;
+      const pl = String(l.pipeline_id), st = String(l.status_id);
+      out.por_pipeline[pl] = (out.por_pipeline[pl] ?? 0) + 1;
+      out.por_status[st] = (out.por_status[st] ?? 0) + 1;
+      if (getFieldValue(l, fIdPac)) out.com_cnn++; else out.sem_cnn++;
+    }
+    pag++;
+    if (!r?._links?.next) { out.fim = true; break; }
+  }
+  out.proxima_pagina = pag;
+  return Response.json(out);
+}
+
 // Readers do SWEEP: teto RÍGIDO de páginas (independente do contador global subreqUsados) →
 // seguros sob concorrência (requests paralelos não se corrompem via o global). Janela futura é
 // consultada à parte (detecção confiável do Bloco Futuro, sem depender de ordenação da paginação).
@@ -5778,6 +5811,12 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
       if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
       resetSubreq();
       return handleDebugAudit(req, env);
+    }
+
+    if (pathname === "/debug-contar-leads") { // conta TODOS os leads do Kommo (ganho/perdido/sem-vínculo) — read-only
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      resetSubreq();
+      return handleContarLeads(req, env);
     }
 
     if (pathname === "/debug-backfill-preview") {
