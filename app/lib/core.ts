@@ -5215,8 +5215,9 @@ async function handleDebugAudit(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
   const target: CnnTarget = url.searchParams.get("env") === "production" ? "production" : "sandbox";
   const offset = Math.max(0, Number(url.searchParams.get("offset") ?? "0") || 0);
-  const limite = Math.min(40, Math.max(1, Number(url.searchParams.get("limite") ?? "10") || 10));
+  const limite = Math.min(120, Math.max(1, Number(url.searchParams.get("limite") ?? "60") || 60));
   const t0 = Date.now();
+  const GUARDA_MS = 250000; // maxDuration=300s → guarda folgada; um paciente lento ainda cabe antes do teto
   const fields = await resolveFields(env);
   const fIdPac = fields["ID Paciente CNN"];
   const fInativo = fields["Inativo"];
@@ -5233,7 +5234,7 @@ async function handleDebugAudit(req: Request, env: Env): Promise<Response> {
   };
 
   for (const r of rows) {
-    if (Date.now() - t0 > 45000) { out.parou_tempo = true; break; }
+    if (Date.now() - t0 > GUARDA_MS) { out.parou_tempo = true; break; }
     const pid = String(r.paciente_id_cnn);
     out.examinados++;
     resetSubreq(); // orçamento de leitura por-paciente (mig funcs usam orcamentoOk); na Vercel não há teto real
