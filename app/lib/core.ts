@@ -4104,7 +4104,8 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
     }
     try {
       const fields = await resolveFields(env);
-      const lead: any = await kommoGet(`/leads/${FX_LEAD}`, env);
+      const leadAlvo = url.searchParams.get("lead") ?? FX_LEAD;
+      const lead: any = await kommoGet(`/leads/${leadAlvo}`, env);
       out.lead = { id: lead.id, pipeline: lead.pipeline_id, status: lead.status_id,
         id_agenda_cnn: getFieldValue(lead, fields["ID Agenda CNN"]),
         id_paciente_cnn: getFieldValue(lead, fields["ID Paciente CNN"]),
