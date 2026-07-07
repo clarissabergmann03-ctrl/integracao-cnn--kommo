@@ -4049,6 +4049,22 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
     catch (e: any) { return Response.json({ modo, pid, erro: String(e?.message ?? e) }, { status: 502 }); }
   }
 
+  if (modo === "tipos") { // read-only: descobre os ids de PRODUÇÃO (tipoConsulta/tipoProcedimento/localAgenda)
+    const out: any = { modo, target };
+    try { const r: any = await cnnGet("/tipo-consulta/lista?registrosPorPagina=200&pagina=0", env, target);
+      out.tipo_consulta = (r?.lista ?? []).map((t: any) => ({ id: t.id ?? t.idTipoConsulta, nome: t.nome ?? t.descricao ?? t.nomeTipoConsulta, ativo: t.ativo })); }
+    catch (e: any) { out.tipo_consulta_erro = String(e?.message ?? e); }
+    try { const r: any = await cnnGet("/tipo-procedimento/lista?registrosPorPagina=200&pagina=0&tipo=TODOS", env, target);
+      out.tipo_procedimento = (r?.lista ?? []).map((t: any) => ({ id: t.id ?? t.idTipoProcedimento, nome: t.nome ?? t.descricao, ativo: t.ativo })); }
+    catch (e: any) { out.tipo_procedimento_erro = String(e?.message ?? e); }
+    const di = url.searchParams.get("di") ?? tomorrowBRT();
+    const df = url.searchParams.get("df") ?? di;
+    try { const r: any = await cnnGet(`/agenda/lista?dataInicial=${di}&dataFinal=${df}&registrosPorPagina=5&pagina=0`, env, target);
+      out.agenda_amostra = (r?.lista ?? []).slice(0, 3); out.di = di; out.df = df; }
+    catch (e: any) { out.agenda_amostra_erro = String(e?.message ?? e); }
+    return Response.json(out);
+  }
+
   if (modo === "criar") {
    try {
     // ── DEDUP POR NÚMERO (telefone). id do paciente é secundário. ──
@@ -4096,12 +4112,15 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
     const data = url.searchParams.get("data") ?? tomorrowBRT();
     const hora = url.searchParams.get("hora") ?? "10:00";
     const horaFim = addMinutes(hora, 30);
+    const idTipoConsulta = Number(url.searchParams.get("tipoConsulta") ?? CNN_TIPO_CONSULTA);
+    const idLocalAgenda  = Number(url.searchParams.get("localAgenda")  ?? CNN_LOCAL_AGENDA);
+    const idTipoProc     = Number(url.searchParams.get("tipoProc")     ?? CNN_TIPO_PROCEDIMENTO);
     const agenda: any = await cnnPost("/agenda/novo", {
       data, horaInicio: `${hora}:00`, horaFim: `${horaFim}:00`,
       idPaciente, idPacienteConvenio,
-      idTipoConsulta: CNN_TIPO_CONSULTA, idLocalAgenda: CNN_LOCAL_AGENDA,
+      idTipoConsulta, idLocalAgenda,
       status: "AGENDADO",
-      procedimentos: [{ idTipoProcedimento: CNN_TIPO_PROCEDIMENTO, quantidade: 1 }],
+      procedimentos: [{ idTipoProcedimento: idTipoProc, quantidade: 1 }],
     }, env, target);
 
     const fields = await resolveFields(env);
@@ -4110,7 +4129,7 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
       { id: fields["ID Paciente CNN"], value: String(idPaciente) },
     ], env);
 
-    return Response.json({ modo, ok: true, criou_paciente: criou, idPaciente, idTipoConvenio: idTipoConv, idPacienteConvenio, idAgenda: agenda?.id, data, hora, lead: FX_LEAD, vinculado: true });
+    return Response.json({ modo, ok: true, criou_paciente: criou, idPaciente, idTipoConvenio: idTipoConv, idPacienteConvenio, idTipoConsulta, idLocalAgenda, idTipoProc, idAgenda: agenda?.id, data, hora, lead: FX_LEAD, vinculado: true });
    } catch (e: any) {
     return Response.json({ modo, ok: false, erro: String(e?.message ?? e), stack: String(e?.stack ?? "").split("\n").slice(0, 4) }, { status: 500 });
    }
