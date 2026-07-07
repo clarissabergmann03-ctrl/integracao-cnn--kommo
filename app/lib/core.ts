@@ -4091,6 +4091,27 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
     return Response.json(out);
   }
 
+  if (modo === "verificar") { // read-only: confirma no DESTINO REAL (agenda no CNN + lead no Kommo)
+    const out: any = { modo };
+    const ag = url.searchParams.get("agenda") ?? "";
+    const dataAg = url.searchParams.get("data") ?? "";
+    if (ag && dataAg) {
+      try { const r: any = await cnnGet(`/agenda/lista?dataInicial=${dataAg}&dataFinal=${dataAg}&registrosPorPagina=200&pagina=0`, env, target);
+        const a = (r?.lista ?? []).find((x: any) => String(x.id) === ag);
+        out.agenda_cnn = a ? { id: a.id, status: a.status, data: a.data, hi: a.horaInicio, hf: a.horaFim, idTipoConsulta: a.idTipoConsulta, idLocalAgenda: a.idLocalAgenda, idPaciente: a.idPaciente } : { achou: false, dica: "não está na lista desse dia" }; }
+      catch (e: any) { out.agenda_erro = String(e?.message ?? e); }
+    }
+    try {
+      const fields = await resolveFields(env);
+      const lead: any = await kommoGet(`/leads/${FX_LEAD}`, env);
+      out.lead = { id: lead.id, pipeline: lead.pipeline_id, status: lead.status_id,
+        id_agenda_cnn: getFieldValue(lead, fields["ID Agenda CNN"]),
+        id_paciente_cnn: getFieldValue(lead, fields["ID Paciente CNN"]),
+        agendamento: getFieldValue(lead, fields["AGENDAMENTO"]) };
+    } catch (e: any) { out.lead_erro = String(e?.message ?? e); }
+    return Response.json(out);
+  }
+
   if (modo === "criar") {
    try {
     // ── DEDUP POR NÚMERO (telefone). id do paciente é secundário. ──
