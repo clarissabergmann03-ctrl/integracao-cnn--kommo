@@ -4147,7 +4147,7 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
     if (ag && dataAg) {
       try { const r: any = await cnnGet(`/agenda/lista?dataInicial=${dataAg}&dataFinal=${dataAg}&registrosPorPagina=200&pagina=0`, env, target);
         const a = (r?.lista ?? []).find((x: any) => String(x.id) === ag);
-        out.agenda_cnn = a ? { id: a.id, status: a.status, data: a.data, hi: a.horaInicio, hf: a.horaFim, idTipoConsulta: a.idTipoConsulta, idLocalAgenda: a.idLocalAgenda, idPaciente: a.idPaciente } : { achou: false, dica: "não está na lista desse dia" }; }
+        out.agenda_cnn = a ? { id: a.id, status: a.status, data: a.data, hi: a.horaInicio, hf: a.horaFim, idTipoConsulta: a.idTipoConsulta, idLocalAgenda: a.idLocalAgenda, idPaciente: a.idPaciente, procedimentos: (a.procedimentos ?? []).map((x: any) => x.idTipoProcedimento) } : { achou: false, dica: "não está na lista desse dia" }; }
       catch (e: any) { out.agenda_erro = String(e?.message ?? e); }
     }
     try {
@@ -4196,7 +4196,7 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
     await purgarGemeoFeito(chave, env);
     await filaEnfileirarLote([{
       chave, tipo: "CNN_AGENDAR", paciente_id_cnn: String(pid), grupo: "B",
-      payload: { leadId: FX_LEAD, pid: String(pid), ts, tipoNome },
+      payload: { leadId: FX_LEAD, pid: String(pid), ts, tipoNome, ...(((url.searchParams.get("procids") ?? "").split(",").filter(Boolean).map(Number)).length ? { procIds: (url.searchParams.get("procids") ?? "").split(",").filter(Boolean).map(Number) } : {}) },
     }], env);
     return Response.json({ modo, enfileirado: "CNN_AGENDAR", chave, ts, data, hora, tipoNome, pid, lead: FX_LEAD });
   }
