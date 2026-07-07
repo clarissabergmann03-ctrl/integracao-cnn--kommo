@@ -2037,7 +2037,7 @@ async function consumirItemA4(item: any, env: Env, target: CnnTarget, dryRun: bo
 // terminal (Perdido/Avaliação/etc.) — exceção FINALIZADO segue MAPA_STATUS (§4).
 // Chave inclui status+ts da vigente → re-enfileira quando muda. Sem fetch além da
 // paginação (usa mapas D1 carregados em massa).
-async function produtorSync(env: Env, target: CnnTarget, windowDays: number): Promise<any> {
+async function produtorSync(env: Env, target: CnnTarget, windowDays: number, soPid?: string): Promise<any> {
   await ensureSchema(env);
   const tiposMap = await resolveTiposConsulta(env, target);
   const ini = new Date(Date.now() - 3 * 3600 * 1000 - 2 * 24 * 3600 * 1000).toISOString().slice(0, 10);
@@ -2063,6 +2063,7 @@ async function produtorSync(env: Env, target: CnnTarget, windowDays: number): Pr
   type Ag = { id: string; status: string; ts: number; tel: string };
   const porPaciente = new Map<string, { A: Ag[]; B: Ag[] }>();
   for (const a of todas) {
+    if (soPid && String(a.idPaciente ?? "") !== soPid) continue; // validação escopada ao paciente de teste (blast radius=1)
     if (isTarefaInterna(a)) { out.pulados_interno++; continue; }
     const grupo = grupoDaAgenda(a, tiposMap);
     if (!grupo) { out.pulados_tipo++; continue; }
@@ -5566,7 +5567,7 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
       try {
         if (u.searchParams.get("clear") === "1") { await env.DB.prepare("DELETE FROM fila_trabalho").run(); out.fila_limpa = true; }
         if (runProd) {
-          if (job === "sync") out.produtor = await produtorSync(env, target, windowDays);
+          if (job === "sync") out.produtor = await produtorSync(env, target, windowDays, u.searchParams.get("sopid") ?? undefined);
           else if (job === "vespera") out.produtor = await produtorVespera(env, target, u.searchParams.get("data") ?? undefined, u.searchParams.get("sopid") ?? undefined);
           else if (job === "orcamento") out.produtor = await produtorOrcamento(env, target, budget);
           else out.produtor = await produtorBackfill(env, target, windowDays, soTeste);
