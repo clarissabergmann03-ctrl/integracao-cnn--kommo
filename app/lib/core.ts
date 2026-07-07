@@ -5251,9 +5251,11 @@ async function handleDebugAudit(req: Request, env: Env): Promise<Response> {
       const cards = (raw._embedded?.leads ?? []).filter((l: any) => getFieldValue(l, fIdPac) === pid);
 
       const divs: string[] = [];
-      const porPipe: Record<string, number> = {};
-      for (const c of cards) porPipe[String(c.pipeline_id)] = (porPipe[String(c.pipeline_id)] ?? 0) + 1;
-      if (Object.values(porPipe).some((n) => n > 1) || cards.length > 2) { out.div_duplicata++; divs.push("duplicata"); }
+      // Duplicata: máx 1 card por GRUPO (A = Captação/Pós-Consulta; B = Pós-Venda). Conta por grupo,
+      // não por pipeline — assim pega "2 cards no lado A" (captação + pós-consulta juntos).
+      const porGrupo: Record<string, number> = { A: 0, B: 0 };
+      for (const c of cards) porGrupo[Number(c.pipeline_id) === PIPELINE_POS_VENDA ? "B" : "A"]++;
+      if (porGrupo.A > 1 || porGrupo.B > 1 || cards.length > 2) { out.div_duplicata++; divs.push("duplicata"); }
 
       const cardAlvo = cards.find((c: any) => Number(c.pipeline_id) === alvo.pipeline);
       if (!cardAlvo) { out.sem_card_alvo++; divs.push("sem_card_alvo"); }
