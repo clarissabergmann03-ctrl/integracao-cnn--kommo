@@ -4042,7 +4042,8 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
     if (!idPaciente) {
       // ÚNICA exceção autorizada ao §7.8: POST /paciente/novo p/ o paciente de teste.
       // fetch direto (não passa por cnnPost/assertCnnWritable) → guardrail global segue intacto p/ todo o resto.
-      const body = { nome: FX_NOME, dataNascimento: "1900-01-01", contato: { telefoneCelular: normalizePhone(FX_PHONE) } };
+      const nome = url.searchParams.get("nome") ?? FX_NOME;
+      const body = { nome, dataNascimento: "1900-01-01", contato: { telefoneCelular: normalizePhone(FX_PHONE) } };
       const res = await fetchComRetry(() => { bumpSubreq(); return fetch(`${CNN_BASE}/paciente/novo`, {
         method: "POST", headers: cnnHeaders(env, target), body: JSON.stringify(body),
       }); }, retryPost());
