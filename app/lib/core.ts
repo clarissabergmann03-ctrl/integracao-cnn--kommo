@@ -4059,9 +4059,13 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
     catch (e: any) { out.tipo_procedimento_erro = String(e?.message ?? e); }
     const di = url.searchParams.get("di") ?? tomorrowBRT();
     const df = url.searchParams.get("df") ?? di;
-    try { const r: any = await cnnGet(`/agenda/lista?dataInicial=${di}&dataFinal=${df}&registrosPorPagina=5&pagina=0`, env, target);
-      out.agenda_amostra = (r?.lista ?? []).slice(0, 3); out.di = di; out.df = df; }
-    catch (e: any) { out.agenda_amostra_erro = String(e?.message ?? e); }
+    const localFiltro = url.searchParams.get("local") ?? "";
+    try { const r: any = await cnnGet(`/agenda/lista?dataInicial=${di}&dataFinal=${df}&registrosPorPagina=200&pagina=0`, env, target);
+      let ags = (r?.lista ?? []).map((a: any) => ({ hi: a.horaInicio, hf: a.horaFim, local: a.idLocalAgenda, tipo: a.idTipoConsulta, status: a.status }));
+      if (localFiltro) ags = ags.filter((a: any) => String(a.local) === localFiltro);
+      ags.sort((a: any, b: any) => String(a.hi).localeCompare(String(b.hi)));
+      out.di = di; out.df = df; out.local_filtro = localFiltro || null; out.agenda_total = ags.length; out.ocupados = ags; }
+    catch (e: any) { out.agenda_erro = String(e?.message ?? e); }
     return Response.json(out);
   }
 
