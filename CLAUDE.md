@@ -110,6 +110,24 @@ Worker Cloudflare (Free) que integra **Clínica nas Nuvens (CNN) → Kommo CRM**
 - **Webhooks p/ o dono configurar no Kommo:** `POST .../webhook/confirmacao?secret=<WEBHOOK_SECRET>` (etapa Consulta Confirmada) e `POST .../webhook/pos-venda-agendar?secret=<WEBHOOK_SECRET>` (etapa Cliente Ativo), corpo `leads[status][0][id]=<id>`.
 - **GO-LIVE (passos do dono):** já feito = deploy + `/wh-criar-campo` + validação ao vivo em sandbox. **Falta só:** no `wrangler.toml [vars]` setar `CNN_WRITE_TARGET="production"` + `WH1_ENABLED="1"` + `WH2_ENABLED="1"` → `wrangler deploy` → observar `/debug-audit` + `/debug-fila-erros`. Pode ligar gradual (só WH1 primeiro). ⚠️ Com flags ON + sandbox, confirmações reais geram dead-letter (agenda real tem id de prod, não existe no sandbox) — por isso o estado seguro fora do go-live é flags OFF.
 
+## MIGRAÇÃO github/vercel/supabase (EM ANDAMENTO — hábito: atualizar a CADA avanço de código/deploy)
+> Stack nova = **Vercel Functions (Node)** = lógica + **Supabase Postgres** = banco + **pg_cron/pg_net** = cron 1min → `/api/tick` + **GitHub** repo `clarissabergmann03-ctrl/integracao-cnn--kommo`. **CF SEGUE EM PRODUÇÃO até o cutover.** Plano: `docs/superpowers/plans/2026-07-06-plano-github-vercel-supabase.md`. Estado detalhado na memória `[[migracao-supabase]]`.
+> Deploy Vercel atual (preview público): `kommo-h6a6dmm8f-…vercel.app` (selftest 57/57). App em `app/` (subdir isolado do worker legado `src/`).
+
+**FEITO:**
+- **Fase 1 Fundação** ✅ — Supabase `qfyivaualpgqxjbrrleo` (sa-east-1), 9 tabelas + pg_cron/pg_net, camada `app/lib/db.ts` (postgres.js, pooler `aws-1-sa-east-1:6543`, `prepare:false`, `?`→`$n`).
+- **Fase 2 Porte** ✅ — `src/index.ts`→`app/lib/core.ts` (`handleFetch`/`handleScheduled`), `api/index.ts` (roteador) + `api/tick.ts`, `lib/env.ts` injeta DB. Selftests 57/57 (52+5 guardrail) local (tsx) e no deploy. Dialeto: `ensureSchema`→no-op, `INSERT OR IGNORE`→`ON CONFLICT`, imports `.js`.
+- **Dados migrados** ✅ — 6 tabelas de idempotência (mapeamento 1556, agenda_sync 628, orcamento_sync 1237, lembrete_d1 146, cursores 3, agendamento_sync 5). auditoria/tick_log/fila NÃO migrados.
+- **RLS** ✅ (crítico) — habilitado nas 9 tabelas + revoke anon/authenticated (anon LIA PII → agora `42501`). App via role `postgres` bypassa. Migration `20260707020000_rls_seguranca.sql`.
+- **Guardrail** ✅ — jamais deletar/alterar paciente no CNN, QUALQUER ambiente (`assertCnnWritable` absoluto + `cnnDelete` sempre lança + 5 selftests).
+
+**FALTA (cutover + validação):**
+- **Cutover:** pg_cron→`/api/tick` (token no Vault), re-apontar webhooks Kommo p/ Vercel, promover prod (URL estável), desligar cron do CF.
+- **Validação write end-to-end (paciente teste 11946800329):** BLOQUEADA — paciente **não existe no CNN produção** (0 agendas/0 orçamentos p/ 28155333 e 28146949; IDs no lead Kommo 17488447 = resíduo sandbox). Precisa fixture: paciente+agenda REAIS no CNN produção.
+- Secrets CNN sandbox não subidos (eram do ambiente de teste).
+
+**Aprendizados Vercel/Supabase:** imports `.js` (NodeNext — `.ts` dá `ERR_MODULE_NOT_FOUND`); `typescript` nas devDeps faz a Vercel type-checar (TS2347 = warnings não-fatais); `ssoProtection:null` via API p/ público; env via API `/v10/projects/{id}/env?upsert=true`; pooler = `aws-1-sa-east-1` (não aws-0); token CF IP-restrito (IP de saída 200.149.56.26, oscila).
+
 ## Trabalho em andamento
 > **Fase atual (05/07): MODO MANUTENÇÃO** — correções de bugs, coisas que não funcionam e pequenas funcionalidades. Migração já deployada/executada e cron saudável (60/60 ticks ok, 05/07). Hábito acordado com o dono: **atualizar este CLAUDE.md continuamente conforme as descobertas** (bugs achados, correções, features novas, estado do deploy).
 → 2 Webhooks Kommo→CNN (confirmar + agendar pós-venda; remarcar removido): CONSTRUÍDO+CERTIFICADO, **deploy pendente** + ativação gradual (ver §acima).
