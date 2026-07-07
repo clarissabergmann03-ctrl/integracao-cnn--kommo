@@ -5528,6 +5528,18 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
       catch (e) { return Response.json({ erro: String(e) }, { status: 502 }); }
     }
 
+    if (pathname === "/debug-campos") { // lista os custom_fields do lead (nome/tipo/opções) — read-only
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      try {
+        const r: any = await kommoGet("/leads/custom_fields?limit=250", env);
+        const cf = (r._embedded?.custom_fields ?? []).map((f: any) => ({
+          id: f.id, name: f.name, type: f.type, code: f.code,
+          enums: (f.enums ?? []).map((e: any) => ({ id: e.id, value: e.value })),
+        }));
+        return Response.json({ total: cf.length, campos: cf });
+      } catch (e) { return Response.json({ erro: String(e) }, { status: 502 }); }
+    }
+
     if (pathname === "/debug-fixture-teste") { // monta o paciente/agenda de teste em produção (escopo travado)
       if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
       return handleDebugFixtureTeste(req, env);
