@@ -2,9 +2,9 @@
 // tudo PELO roteador portado (handleFetch). Verdes = lógica + camada de dados portadas fiéis.
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { handleFetch } from './core.ts'
-import { makeEnv } from './env.ts'
-import { sql } from './db.ts'
+import { handleFetch } from './core.js'
+import { makeEnv } from './env.js'
+import { sql } from './db.js'
 
 const env = makeEnv()
 const SECRET = process.env.WEBHOOK_SECRET as string

@@ -1,8 +1,8 @@
 // O tick do cron (= o scheduled() do Worker). Chamado pelo Supabase pg_cron → pg_net
 // a cada minuto (Fase 3). handleScheduled usa ctx.waitUntil; aqui coletamos as promises
 // e aguardamos antes de responder (a função serverless precisa terminar o trabalho).
-import { handleScheduled } from '../lib/core.ts'
-import { makeEnv } from '../lib/env.ts'
+import { handleScheduled } from '../lib/core.js'
+import { makeEnv } from '../lib/env.js'
 
 const env = makeEnv()
 

@@ -1,7 +1,7 @@
 // Roteador único (= o fetch() do Worker). vercel.json faz rewrite /(.*) → /api,
 // então todos os ~50 paths caem aqui e handleFetch roteia (auth ?secret= / Authorization inclusas).
-import { handleFetch } from '../lib/core.ts'
-import { makeEnv } from '../lib/env.ts'
+import { handleFetch } from '../lib/core.js'
+import { makeEnv } from '../lib/env.js'
 
 const env = makeEnv()
 const route = (req: Request) => handleFetch(req, env)

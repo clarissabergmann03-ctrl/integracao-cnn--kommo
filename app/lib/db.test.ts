@@ -1,6 +1,6 @@
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { DB, sql } from './db.ts'
+import { DB, sql } from './db.js'
 
 test('insert + first + all + placeholders ?→$n', async () => {
   const now = Math.floor(Date.now() / 1000)

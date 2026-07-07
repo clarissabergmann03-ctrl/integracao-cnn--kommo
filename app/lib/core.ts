@@ -1,3 +1,5 @@
+// Stubs dos tipos do Cloudflare Workers (só p/ o type-check da Vercel; apagados em runtime).
+type ScheduledEvent = any; type ExecutionContext = any; type D1Database = any;
 const CNN_BASE = "https://api.clinicanasnuvens.com.br";
 
 // IDs fixos da clínica — validados via /discover
