@@ -1030,6 +1030,19 @@ async function resolveTipoConsultaId(nome: string, env: Env, target: CnnTarget):
 function cnnWriteTarget(env: Env): CnnTarget {
   return env.CNN_WRITE_TARGET === "production" ? "production" : "sandbox";
 }
+// IDs de criação de agenda POR AMBIENTE. sandbox×produção têm ids DISTINTOS (bug descoberto 07/07:
+// convênio 56545 / sala 41170 / procedimento 1011844 são SANDBOX e não existem em produção → o
+// POST /agenda/novo do pós-venda dava 400). Produção é overridável por env (o dono ajusta a sala e o
+// procedimento REAIS que a clínica quer nos agendamentos automáticos); default = ids lidos do CNN prod.
+function cnnConvenioParticular(env: Env, target: CnnTarget): number {
+  return target === "production" ? Number(env.CNN_CONVENIO_PARTICULAR_PRODUCTION ?? 27603) : CNN_CONVENIO_PARTICULAR;
+}
+function cnnLocalAgenda(env: Env, target: CnnTarget): number {
+  return target === "production" ? Number(env.CNN_LOCAL_AGENDA_PRODUCTION ?? 19775) : CNN_LOCAL_AGENDA;
+}
+function cnnTipoProcedimento(env: Env, target: CnnTarget): number {
+  return target === "production" ? Number(env.CNN_TIPO_PROCEDIMENTO_PRODUCTION ?? 381357) : CNN_TIPO_PROCEDIMENTO;
+}
 // ── Anti-loop PURO (testável no /debug-selftest): dada a intenção e o estado atual da agenda
 //    (agenda_sync, ou null), decide executar ou suprimir. NÃO toca I/O. ──
 // ⚠️ O ÚNICO guarda anti-loop é a convergência de (last_agendamento_ts ±60s, last_cnn_status).
@@ -1178,8 +1191,8 @@ async function consumirItemCnnAgendar(item: any, env: Env, dryRun: boolean): Pro
   const agenda: any = await cnnPost("/agenda/novo", {
     data, horaInicio: `${hora}:00`, horaFim: `${horaFim}:00`,
     idPaciente: Number(pid), idPacienteConvenio,
-    idTipoConsulta, idLocalAgenda: CNN_LOCAL_AGENDA, status: "AGENDADO",
-    procedimentos: [{ idTipoProcedimento: CNN_TIPO_PROCEDIMENTO, quantidade: 1 }],
+    idTipoConsulta, idLocalAgenda: cnnLocalAgenda(env, wt), status: "AGENDADO",
+    procedimentos: [{ idTipoProcedimento: cnnTipoProcedimento(env, wt), quantidade: 1 }],
   }, env, wt);
   // Marcador durável ANTES de tocar o card (achados B/#9): se o PATCH do card falhar, o retry
   // encontra a agenda via agenda_sync (barreira 1) e NÃO cria outra.
@@ -1265,14 +1278,14 @@ async function upsertOrcamentoSync(
 async function getOrCreateConvenioParticular(idPaciente: number, env: Env, target: CnnTarget = "sandbox"): Promise<number | undefined> {
   try {
     const convenio: any = await cnnPost("/convenio-paciente/associar", {
-      idPaciente, idTipoConvenio: CNN_CONVENIO_PARTICULAR,
+      idPaciente, idTipoConvenio: cnnConvenioParticular(env, target),
     }, env, target);
     if (convenio?.id) return convenio.id;
   } catch { /* provavelmente já associado — busca abaixo */ }
   try {
     const lista: any = await cnnGet(`/convenio-paciente/lista?idPaciente=${idPaciente}&somenteAtivos=true`, env, target);
     const itens = lista?.lista ?? [];
-    const particular = itens.find((c: any) => c.idTipoConvenio === CNN_CONVENIO_PARTICULAR);
+    const particular = itens.find((c: any) => c.idTipoConvenio === cnnConvenioParticular(env, target));
     return (particular ?? itens[0])?.id;
   } catch { return undefined; }
 }
@@ -3520,6 +3533,15 @@ function runSelftestLogic(): SelftestResultado {
   selftestAssert(acc, "guardrail:PUT /paciente/1 sandbox → LANÇA (não altera paciente)", true, cnnLanca(() => assertCnnWritable("sandbox", "PUT", "/paciente/1")));
   selftestAssert(acc, "guardrail:GET /paciente/1 → NÃO lança (leitura permitida)", false, cnnLanca(() => assertCnnWritable("sandbox", "GET", "/paciente/1")));
 
+  // ── config de criação de agenda por ambiente (bug sandbox×produção, 07/07) ──
+  selftestAssert(acc, "cfg:convênio produção = 27603", 27603, cnnConvenioParticular({} as any, "production"));
+  selftestAssert(acc, "cfg:convênio sandbox = 56545", 56545, cnnConvenioParticular({} as any, "sandbox"));
+  selftestAssert(acc, "cfg:localAgenda produção = 19775", 19775, cnnLocalAgenda({} as any, "production"));
+  selftestAssert(acc, "cfg:localAgenda sandbox = 41170", 41170, cnnLocalAgenda({} as any, "sandbox"));
+  selftestAssert(acc, "cfg:tipoProc produção = 381357", 381357, cnnTipoProcedimento({} as any, "production"));
+  selftestAssert(acc, "cfg:tipoProc sandbox = 1011844", 1011844, cnnTipoProcedimento({} as any, "sandbox"));
+  selftestAssert(acc, "cfg:localAgenda produção overridável por env", 19779, cnnLocalAgenda({ CNN_LOCAL_AGENDA_PRODUCTION: "19779" } as any, "production"));
+
   return { mode: "logic", passed: acc.passed, failed: acc.failed, total: acc.passed + acc.failed, falhas: acc.falhas };
 }
 
@@ -4100,7 +4122,7 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
     if (!idPaciente) return Response.json({ modo, erro: "sem idPaciente" }, { status: 500 });
 
     // Convênio: idTipoConvenio de PRODUÇÃO via ?convenio= (senão a constante, que pode ser sandbox).
-    const idTipoConv = Number(url.searchParams.get("convenio") ?? CNN_CONVENIO_PARTICULAR);
+    const idTipoConv = Number(url.searchParams.get("convenio") ?? cnnConvenioParticular(env, "production"));
     let idPacienteConvenio: number | undefined; const convDetalhe: any = {};
     try { const a: any = await cnnPost("/convenio-paciente/associar", { idPaciente, idTipoConvenio: idTipoConv }, env, target); idPacienteConvenio = a?.id; convDetalhe.assoc = a; }
     catch (e: any) { convDetalhe.assoc_erro = String(e?.message ?? e); }
@@ -4116,9 +4138,9 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
     const data = url.searchParams.get("data") ?? tomorrowBRT();
     const hora = url.searchParams.get("hora") ?? "10:00";
     const horaFim = addMinutes(hora, 30);
-    const idTipoConsulta = Number(url.searchParams.get("tipoConsulta") ?? CNN_TIPO_CONSULTA);
-    const idLocalAgenda  = Number(url.searchParams.get("localAgenda")  ?? CNN_LOCAL_AGENDA);
-    const idTipoProc     = Number(url.searchParams.get("tipoProc")     ?? CNN_TIPO_PROCEDIMENTO);
+    const idTipoConsulta = Number(url.searchParams.get("tipoConsulta") ?? 66666); // 66666 = Consulta/Avaliação (Grupo A) em produção
+    const idLocalAgenda  = Number(url.searchParams.get("localAgenda")  ?? cnnLocalAgenda(env, "production"));
+    const idTipoProc     = Number(url.searchParams.get("tipoProc")     ?? cnnTipoProcedimento(env, "production"));
     const agenda: any = await cnnPost("/agenda/novo", {
       data, horaInicio: `${hora}:00`, horaFim: `${horaFim}:00`,
       idPaciente, idPacienteConvenio,
@@ -5934,4 +5956,10 @@ interface Env {
   CNN_WRITE_TARGET?: string; // 'sandbox' (default) | 'production' — alvo das escritas dos webhooks
   WH1_ENABLED?: string;      // '1' liga o webhook 1 (Consulta Confirmada → CNN)
   WH2_ENABLED?: string;      // '1' liga o webhook 2 (Pós-Venda Agendar → CNN)
+  // IDs de criação de agenda em PRODUÇÃO (sandbox×prod diferem — descoberto 07/07: os ids sandbox
+  // NÃO existem em produção → POST /agenda/novo 400). Overridáveis por env; default = ids lidos do CNN prod.
+  // Ver cnnConvenioParticular / cnnLocalAgenda / cnnTipoProcedimento.
+  CNN_CONVENIO_PARTICULAR_PRODUCTION?: string;
+  CNN_LOCAL_AGENDA_PRODUCTION?: string;
+  CNN_TIPO_PROCEDIMENTO_PRODUCTION?: string;
 }
