@@ -3392,6 +3392,91 @@ async function handleDebugOrcamento(req: Request, env: Env): Promise<Response> {
   return Response.json(out);
 }
 
+// ══ /debug-nome — survey/backfill do NOME (contato = nome real do CNN; lead = nome + sufixo duplicata) ═
+// Regra do dono (07/07): TODO lead precisa do nome importado. Contato SEMPRE recebe o nome
+// original do paciente; o lead da DUPLICATA (card A quando existe o B do mesmo paciente) mantém
+// " (duplicata)" no nome. Escopo TRAVADO: mexe SÓ no campo `name` do contato e do lead no Kommo.
+// NUNCA lê/escreve outra coisa, NUNCA toca CNN (só GET /paciente/{id} p/ nome), NUNCA move/cria/deleta.
+// modo=survey (read-only) mede o problema; modo=fix&dry=1 mostra o de-para; modo=fix&dry=0 aplica.
+// Paginação por offset/limite; guarda de tempo (45s) p/ caber no limite da Vercel. Ritmado por `limite`.
+function nomeFraco(nome: string | null | undefined, telefone = ""): boolean {
+  const n = (nome ?? "").trim();
+  if (!n) return true;
+  if (/^paciente\b/i.test(n)) return true;              // "Paciente", "Paciente CNN 123", "Paciente 123 (duplicata)"
+  const soDig = n.replace(/[^\d]/g, "");
+  const semEspaco = n.replace(/\s/g, "");
+  if (soDig && soDig === semEspaco) return true;         // nome é só dígitos
+  const telDig = telefone.replace(/[^\d]/g, "");
+  if (telDig && soDig && telDig.slice(-8) === soDig.slice(-8)) return true; // nome = telefone
+  return false;
+}
+async function handleDebugNome(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const modo = url.searchParams.get("modo") ?? "survey";
+  const target: CnnTarget = "production"; // nome vem do CNN de produção (só GET /paciente/{id})
+  const offset = Math.max(0, Number(url.searchParams.get("offset") ?? "0") || 0);
+  const limite = Math.min(150, Math.max(1, Number(url.searchParams.get("limite") ?? "30") || 30));
+  const dry = url.searchParams.get("dry") !== "0";
+  const t0 = Date.now();
+
+  const rows = ((await env.DB.prepare(
+    "SELECT paciente_id_cnn, grupo, lead_id_kommo, duplicata FROM mapeamento WHERE lead_id_kommo IS NOT NULL AND lead_id_kommo <> '' ORDER BY paciente_id_cnn, grupo LIMIT ? OFFSET ?"
+  ).bind(limite, offset).all()).results ?? []) as any[];
+
+  const out: any = {
+    modo, target, dry, offset, limite,
+    examinados: 0, fracos: 0, corrigidos: 0, sem_nome_cnn: 0, ja_ok: 0, erros: 0,
+    amostra: [] as any[], proximo_offset: offset, fim: false,
+  };
+
+  for (const r of rows) {
+    if (Date.now() - t0 > 45000) { out.parou_tempo = true; break; }
+    out.examinados++;
+    const leadId = String(r.lead_id_kommo);
+    const pid = String(r.paciente_id_cnn);
+    try {
+      const lead: any = await kommoGet(`/leads/${leadId}?with=contacts`, env);
+      const emb = lead?._embedded?.contacts?.[0];
+      const contactId = emb?.id ? String(emb.id) : null;
+      if (!contactId) { out.erros++; if (out.amostra.length < 20) out.amostra.push({ pid, grupo: r.grupo, leadId, erro: "lead sem contato" }); continue; }
+      let contactNome: string | undefined = emb?.name;
+      let telefone = "";
+      if (contactNome === undefined) {
+        const c: any = await kommoGet(`/contacts/${contactId}`, env);
+        contactNome = c?.name;
+        telefone = (c?.custom_fields_values ?? []).find((f: any) => f.field_code === "PHONE")?.values?.[0]?.value ?? "";
+      }
+      if (!nomeFraco(contactNome, telefone)) { out.ja_ok++; continue; }
+      out.fracos++;
+      if (modo === "survey") {
+        if (out.amostra.length < 20) out.amostra.push({ pid, grupo: r.grupo, leadId, contactId, nomeContato: contactNome ?? null, nomeLead: lead?.name ?? null });
+        continue;
+      }
+      // modo=fix — nome real vem do CNN
+      const real = (await cnnPacienteNome(pid, env, target))?.trim();
+      if (!real) { out.sem_nome_cnn++; if (out.amostra.length < 20) out.amostra.push({ pid, grupo: r.grupo, leadId, acao: "sem_nome_cnn", nomeContato: contactNome ?? null }); continue; }
+      // Duplicata = card A com um card B irmão do mesmo paciente (o B é o original em Pós-Venda).
+      let duplicata = false;
+      if (r.grupo === "A") { const b: any = await getMapeamento(pid, "B", env); duplicata = !!(b?.lead_id_kommo); }
+      const leadNomeNovo = duplicata ? `${real} (duplicata)` : real;
+      const corrigeLead = nomeFraco(lead?.name); // só reescreve o nome do lead se ele também estiver fraco (não clobber edição humana)
+      if (dry) {
+        if (out.amostra.length < 20) out.amostra.push({ pid, grupo: r.grupo, leadId, contactId, contato_de: contactNome ?? null, contato_para: real, lead_de: lead?.name ?? null, lead_para: corrigeLead ? leadNomeNovo : "(mantém)", duplicata });
+        out.corrigidos++;
+        continue;
+      }
+      await kommoPatch(`/contacts/${contactId}`, { name: real }, env);
+      if (corrigeLead) await kommoPatch(`/leads/${leadId}`, { name: leadNomeNovo }, env);
+      out.corrigidos++;
+      if (out.amostra.length < 20) out.amostra.push({ pid, grupo: r.grupo, leadId, contato_de: contactNome ?? null, contato_para: real, lead_para: corrigeLead ? leadNomeNovo : "(mantido)" });
+      await audit(env, { funcao: "backfill-nome", ambiente: "kommo", entidade_id: leadId, acao: "nome_corrigido", de: String(contactNome ?? ""), para: real, detalhe: `contato${corrigeLead ? "+lead" : ""} pid=${pid} grupo=${r.grupo} dup=${duplicata}` });
+    } catch (e) { out.erros++; if (out.amostra.length < 20) out.amostra.push({ pid, grupo: r.grupo, leadId, erro: String(e).slice(0, 140) }); }
+  }
+  out.proximo_offset = offset + out.examinados;
+  out.fim = !out.parou_tempo && rows.length < limite;
+  return Response.json(out);
+}
+
 // ══ /debug-orcamento-impacto — mede (READ-ONLY) o que o ORC faria nos APROVADOS ═
 // Sem enfileirar, sem mover. Pagina os pacientes com orçamento APROVADO e classifica
 // cada um pela MESMA lógica do consumidor (portão de agenda futura + portão de etapa).
@@ -5598,6 +5683,12 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
     if (pathname === "/debug-raw") {
       if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
       return handleDebugRaw(req, env);
+    }
+
+    if (pathname === "/debug-nome") { // survey/backfill do NOME (contato=real; lead-duplicata mantém sufixo) — read-only em modo=survey
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      resetSubreq();
+      return handleDebugNome(req, env);
     }
 
     if (pathname === "/debug-backfill-preview") {
