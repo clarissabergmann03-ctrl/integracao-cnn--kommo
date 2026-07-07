@@ -3403,6 +3403,8 @@ function nomeFraco(nome: string | null | undefined, telefone = ""): boolean {
   const n = (nome ?? "").trim();
   if (!n) return true;
   if (/^paciente\b/i.test(n)) return true;              // "Paciente", "Paciente CNN 123", "Paciente 123 (duplicata)"
+  if (/^lead\s*#/i.test(n)) return true;                // default do Kommo: "Lead #18151238"
+  if (/^(sem\s*nome|contato\s*sem\s*nome)\b/i.test(n)) return true;
   const soDig = n.replace(/[^\d]/g, "");
   const semEspaco = n.replace(/\s/g, "");
   if (soDig && soDig === semEspaco) return true;         // nome é só dígitos
