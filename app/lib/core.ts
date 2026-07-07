@@ -4128,6 +4128,28 @@ async function handleDebugFixtureTeste(req: Request, env: Env): Promise<Response
     return Response.json(out);
   }
 
+  if (modo === "w1") { // valida o lead-agendado (Grupo A / F.Captura) em PRODUÇÃO, escopado ao lead de teste
+   try {
+    const data = url.searchParams.get("data") ?? tomorrowBRT();
+    const hora = url.searchParams.get("hora") ?? "08:15";
+    const ts = brtToUnix(data, hora);
+    const fields = await resolveFields(env);
+    // Setup do lead de teste: reusa paciente 28524071 (id_paciente_cnn preenchido → W1 NÃO cria paciente),
+    // limpa id_agenda_cnn (senão o W1 pula por already_synced), seta AGENDAMENTO.
+    await setLeadFields(FX_LEAD, [
+      { id: fields["ID Paciente CNN"], value: url.searchParams.get("pid") ?? "28524071" },
+      { id: fields["ID Agenda CNN"], value: "" },
+      { id: fields["AGENDAMENTO"], value: String(ts) },
+    ], env);
+    // Dispara o W1 exatamente como o webhook real (form-urlencoded).
+    const fakeReq = new Request("https://x/webhook/lead-agendado", { method: "POST",
+      body: `leads[status][0][id]=${FX_LEAD}`, headers: { "Content-Type": "application/x-www-form-urlencoded" } });
+    const resp = await handleLeadAgendado(fakeReq, env);
+    const w1 = await resp.json().catch(() => ({ status: resp.status }));
+    return Response.json({ modo, data, hora, ts, lead: FX_LEAD, w1 });
+   } catch (e: any) { return Response.json({ modo, ok: false, erro: String(e?.message ?? e), stack: String(e?.stack ?? "").split("\n").slice(0, 4) }, { status: 500 }); }
+  }
+
   if (modo === "posvenda") { // exercita o fluxo REAL de pós-venda agendar (Grupo B): enfileira CNN_AGENDAR
     // igual ao /webhook/pos-venda-agendar (mesma chave/payload/fila). O consumidor cria a agenda no CNN.
     const pid = url.searchParams.get("pid") ?? "";
