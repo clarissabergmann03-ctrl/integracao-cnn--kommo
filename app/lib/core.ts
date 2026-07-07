@@ -256,8 +256,23 @@ function cnnProducaoPermitido(method: string, path: string, status?: string): bo
   return false;
 }
 function assertCnnWritable(target: CnnTarget, method: string, path: string, status?: string): void {
+  const m = method.toUpperCase();
+  const p = path.split("?")[0];
+  // ── GUARDRAIL ABSOLUTO (dono, INVIOLÁVEL — vale em TODOS os ambientes: sandbox E produção).
+  //    JAMAIS apagar nada no CNN e NUNCA deletar/alterar paciente. Independe do allowlist de produção.
+  if (m === "DELETE")
+    throw new Error(`BLOQUEADO (guardrail): DELETE ${path} — proibido apagar QUALQUER coisa no CNN, em qualquer ambiente`);
+  if (/^\/paciente\b/.test(p) && m !== "GET" && m !== "POST")
+    throw new Error(`BLOQUEADO (guardrail): ${m} ${path} — jamais deletar/alterar paciente no CNN`);
+  // ── Allowlist de escrita em PRODUÇÃO (§7.8) ──
   if (target === "production" && !cnnProducaoPermitido(method, path, status))
     throw new Error(`BLOQUEADO §7.8: ${method} ${path} (status=${status ?? "-"}) — fora do allowlist de escrita CNN produção`);
+}
+// GUARDRAIL: o CNN NÃO tem operação de delete no nosso código. Qualquer chamada LANÇA (defesa
+// em profundidade — nunca apagar paciente/agenda/nada, em nenhum ambiente). Existe só para travar
+// qualquer uso futuro de delete no CNN por engano.
+async function cnnDelete(path: string, _env: Env, _target: CnnTarget = "sandbox"): Promise<never> {
+  throw new Error(`BLOQUEADO (guardrail): DELETE ${path} — proibido apagar dados/paciente no CNN, em qualquer ambiente`);
 }
 async function cnnGet(path: string, env: Env, target: CnnTarget = "sandbox", retry: RetryOpts = retryPadrao()): Promise<any> {
   const res = await fetchComRetry(() => { bumpSubreq(); return fetch(`${CNN_BASE}${path}`, { headers: cnnHeaders(env, target) }); }, retry);
@@ -3496,6 +3511,14 @@ function runSelftestLogic(): SelftestResultado {
   selftestAssert(acc, "allowlist:POST /orcamento/novo → BLOQUEIA", false, cnnProducaoPermitido("POST", "/orcamento/novo"));
   selftestAssert(acc, "allowlist:PUT /paciente/1 → BLOQUEIA", false, cnnProducaoPermitido("PUT", "/paciente/1"));
   selftestAssert(acc, "allowlist:DELETE /agenda/1 → BLOQUEIA (nunca apaga)", false, cnnProducaoPermitido("DELETE", "/agenda/1"));
+
+  // ── GUARDRAIL ABSOLUTO: jamais deletar/alterar paciente no CNN, em NENHUM ambiente (sandbox E produção) ──
+  const cnnLanca = (fn: () => void) => { try { fn(); return false; } catch { return true; } };
+  selftestAssert(acc, "guardrail:DELETE /paciente/1 sandbox → LANÇA", true, cnnLanca(() => assertCnnWritable("sandbox", "DELETE", "/paciente/1")));
+  selftestAssert(acc, "guardrail:DELETE /paciente/1 production → LANÇA", true, cnnLanca(() => assertCnnWritable("production", "DELETE", "/paciente/1")));
+  selftestAssert(acc, "guardrail:DELETE /agenda/1 sandbox → LANÇA (nunca apaga nada)", true, cnnLanca(() => assertCnnWritable("sandbox", "DELETE", "/agenda/1")));
+  selftestAssert(acc, "guardrail:PUT /paciente/1 sandbox → LANÇA (não altera paciente)", true, cnnLanca(() => assertCnnWritable("sandbox", "PUT", "/paciente/1")));
+  selftestAssert(acc, "guardrail:GET /paciente/1 → NÃO lança (leitura permitida)", false, cnnLanca(() => assertCnnWritable("sandbox", "GET", "/paciente/1")));
 
   return { mode: "logic", passed: acc.passed, failed: acc.failed, total: acc.passed + acc.failed, falhas: acc.falhas };
 }
