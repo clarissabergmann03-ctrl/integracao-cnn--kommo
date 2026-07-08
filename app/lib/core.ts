@@ -5214,8 +5214,10 @@ async function handleMigProbe(req: Request, env: Env): Promise<Response> {
 async function handleDebugAudit(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
   const target: CnnTarget = url.searchParams.get("env") === "production" ? "production" : "sandbox";
+  const fonte = url.searchParams.get("fonte") ?? "mapeamento"; // mapeamento (ativos, 1.246) | kommo (base inteira CNN, 8.805)
   const offset = Math.max(0, Number(url.searchParams.get("offset") ?? "0") || 0);
-  const limite = Math.min(120, Math.max(1, Number(url.searchParams.get("limite") ?? "60") || 60));
+  const pagina = Math.max(1, Number(url.searchParams.get("pagina") ?? "1") || 1);
+  const limite = Math.min(120, Math.max(1, Number(url.searchParams.get("limite") ?? (fonte === "kommo" ? "40" : "60")) || 60));
   const t0 = Date.now();
   const GUARDA_MS = 250000; // maxDuration=300s → guarda folgada; um paciente lento ainda cabe antes do teto
   const fields = await resolveFields(env);
@@ -5223,14 +5225,25 @@ async function handleDebugAudit(req: Request, env: Env): Promise<Response> {
   const fInativo = fields["Inativo"];
   const tiposMap = await resolveTiposConsulta(env, target);
 
-  const rows = ((await env.DB.prepare(
-    "SELECT DISTINCT paciente_id_cnn FROM mapeamento WHERE lead_id_kommo IS NOT NULL AND lead_id_kommo <> '' ORDER BY paciente_id_cnn LIMIT ? OFFSET ?"
-  ).bind(limite, offset).all()).results ?? []) as any[];
+  let rows: any[] = [];
+  let proxPaginaKommo: number | null = null, kommoVazio = false;
+  if (fonte === "kommo") { // pagina /leads (inclui perdido/ganho): 1 auditoria por pid distinto da página
+    const raw: any = await kommoGet(`/leads?limit=${limite}&page=${pagina}`, env);
+    const leads = raw?._embedded?.leads ?? [];
+    if (!leads.length) kommoVazio = true;
+    const seen = new Set<string>();
+    for (const l of leads) { const p = getFieldValue(l, fIdPac); if (p && !seen.has(String(p))) { seen.add(String(p)); rows.push({ paciente_id_cnn: p }); } }
+    proxPaginaKommo = raw?._links?.next ? pagina + 1 : null;
+  } else {
+    rows = ((await env.DB.prepare(
+      "SELECT DISTINCT paciente_id_cnn FROM mapeamento WHERE lead_id_kommo IS NOT NULL AND lead_id_kommo <> '' ORDER BY paciente_id_cnn LIMIT ? OFFSET ?"
+    ).bind(limite, offset).all()).results ?? []) as any[];
+  }
 
   const out: any = {
-    target, offset, limite, examinados: 0,
+    target, fonte, offset, pagina, limite, examinados: 0,
     div_etapa: 0, div_inativo: 0, div_valor: 0, div_duplicata: 0, sem_card_alvo: 0, erro_leitura: 0, erros: 0, ok: 0,
-    amostra: [] as any[], proximo_offset: offset, fim: false,
+    amostra: [] as any[], proximo_offset: offset, proxima_pagina: pagina, fim: false,
   };
 
   for (const r of rows) {
@@ -5275,8 +5288,13 @@ async function handleDebugAudit(req: Request, env: Env): Promise<Response> {
       });
     } catch (e) { out.erros++; if (out.amostra.length < 25) out.amostra.push({ pid, erro: String(e).slice(0, 160) }); }
   }
-  out.proximo_offset = offset + out.examinados;
-  out.fim = !out.parou_tempo && rows.length < limite;
+  if (fonte === "kommo") {
+    out.proxima_pagina = proxPaginaKommo ?? pagina;
+    out.fim = kommoVazio || (proxPaginaKommo === null && !out.parou_tempo);
+  } else {
+    out.proximo_offset = offset + out.examinados;
+    out.fim = !out.parou_tempo && rows.length < limite;
+  }
   return Response.json(out);
 }
 
