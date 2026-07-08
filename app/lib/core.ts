@@ -5353,11 +5353,33 @@ async function handleDebugNotas(req: Request, env: Env): Promise<Response> {
   return Response.json(out);
 }
 
+// Title-case leve (preposições minúsculas).
+function tituloNome(s: string): string {
+  return s.trim().replace(/\s+/g, " ").split(" ")
+    .map((w) => /^(de|da|do|dos|das|e)$/i.test(w) ? w.toLowerCase() : (w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()))
+    .join(" ").trim();
+}
+// Caso FAMÍLIA (dono 07/07): contato é um parente sem nome próprio ("Mãe - Eduarda", "Esposa (Anderson)").
+// Extrai o NOME DO PACIENTE principal e devolve "<Paciente> [Familia]" (1 número = vários pacientes da família,
+// 1 card só que movimenta). Retorna null se não for padrão de parente ou não achar o nome do paciente.
+function extrairFamilia(nomeOrig: string): string | null {
+  const n = (nomeOrig ?? "").trim();
+  if (!/^(m[ãa]e|esposa|marid|espos|pai\b|filh|irm[ãa]|sogr|av[óo]|tia|tio|respons)/i.test(n)) return null;
+  let pac = "";
+  const paren = /\(([^)]+)\)/.exec(n);
+  if (paren) pac = paren[1];
+  else pac = n.replace(/^(m[ãa]e|esposa|marid\w*|espos\w*|pai|filh\w*|irm\w+|sogr\w*|av[óo]|tia|tio|respons\w*)\s*(do\s*paciente|do|da|de)?\s*[-–:]*\s*/i, "");
+  pac = pac.replace(/\bpaciente\b/gi, "").replace(/[.()]/g, "").replace(/\s+/g, " ").trim();
+  if ((pac.match(/[a-zà-ú]/gi) || []).length < 3) return null;
+  return tituloNome(pac) + " [Familia]";
+}
 // Extrai {nome limpo, observação} de um nome de contato poluído com anotação. Conservador:
 // a observação SEMPRE guarda o nome ORIGINAL inteiro (zero perda). O nome limpo é best-effort;
 // se não der pra extrair com confiança, marca `revisar` e NÃO mexe no nome (só grava a obs).
 function extrairNomeObs(nomeOrig: string): { nome: string; obs: string; revisar: boolean } {
   const obs = (nomeOrig ?? "").trim().replace(/\s+/g, " ");
+  const fam = extrairFamilia(nomeOrig);                              // FAMÍLIA: parente → "<Paciente> [Familia]"
+  if (fam) return { nome: fam, obs, revisar: false };
   let s = " " + (nomeOrig ?? "") + " ";
   s = s.replace(/\([^)]*\)/g, " ");                                  // tira parênteses (já estão na obs)
   const m = s.match(/\s[-–/]\s/);                                    // corta no 1º " - " / " / "
