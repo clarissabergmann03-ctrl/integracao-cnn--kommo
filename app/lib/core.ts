@@ -5380,8 +5380,8 @@ async function handleDebugObs(req: Request, env: Env): Promise<Response> {
   const pagIni = Math.max(1, Number(url.searchParams.get("pagina") ?? "1") || 1);
   const t0 = Date.now();
   const cf: any = await kommoGet("/contacts/custom_fields?limit=250", env);
-  const obsField = (cf._embedded?.custom_fields ?? []).find((f: any) => f.name === "Observação" || f.name === "Observacao");
-  if (!obsField) return Response.json({ erro: "campo Observação não existe — rode /debug-criar-obs primeiro" }, { status: 400 });
+  const obsField = (cf._embedded?.custom_fields ?? []).find((f: any) => f.name === "Observações:" || f.name === "Observação" || f.name === "Observacao");
+  if (!obsField) return Response.json({ erro: "campo Observações: não existe — rode /debug-criar-obs primeiro" }, { status: 400 });
   const reNaoAgendar = /n[ãa]o\s*agendar/i, reAnot = /\([^)]{3,}\)|\s[-–]\s|n[ãa]o\s*agendar|jamais|remarcar/i;
   const bate = (n: string) => filtro === "todos" ? reAnot.test(n) : reNaoAgendar.test(n);
   const out: any = { modo, dry, filtro, pagina_ini: pagIni, contatos: 0, atingidos: 0, movidos: 0, revisar: 0, erros: 0, proxima_pagina: pagIni, fim: false, amostra: [] as any[] };
@@ -5989,14 +5989,17 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
       return handleDebugNotas(req, env);
     }
 
-    if (pathname === "/debug-criar-obs") { // cria o campo "Observação" (textarea) nos CONTATOS — idempotente
+    if (pathname === "/debug-criar-obs") { // cria/garante o campo "Observações:" (textarea) nos CONTATOS — idempotente
       if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
       resetSubreq();
       try {
         const ex: any = await kommoGet("/contacts/custom_fields?limit=250", env);
-        const ja = (ex._embedded?.custom_fields ?? []).find((f: any) => f.name === "Observação" || f.name === "Observacao");
-        if (ja) return Response.json({ ok: true, criado: false, id: ja.id, nome: ja.name });
-        const r: any = await kommoPost("/contacts/custom_fields", [{ name: "Observação", type: "textarea" }], env);
+        const flds = ex._embedded?.custom_fields ?? [];
+        const alvo = flds.find((f: any) => f.name === "Observações:");
+        if (alvo) return Response.json({ ok: true, criado: false, id: alvo.id, nome: alvo.name });
+        const antigo = flds.find((f: any) => f.name === "Observação" || f.name === "Observacao");
+        if (antigo) { await kommoPatch(`/contacts/custom_fields/${antigo.id}`, { name: "Observações:" }, env); return Response.json({ ok: true, renomeado: true, id: antigo.id, nome: "Observações:" }); }
+        const r: any = await kommoPost("/contacts/custom_fields", [{ name: "Observações:", type: "textarea" }], env);
         const id = r?.[0]?.id ?? r?._embedded?.custom_fields?.[0]?.id ?? null;
         return Response.json({ ok: true, criado: true, id });
       } catch (e) { return Response.json({ ok: false, erro: String(e) }, { status: 502 }); }
