@@ -5338,7 +5338,7 @@ async function handleDebugNotas(req: Request, env: Env): Promise<Response> {
       if (reTraco.test(n)) { out.com_traco++; nota = true; }
       if (reValor.test(n)) { out.com_valor++; nota = true; }
       if (n.length > 45) { out.longos++; nota = true; }
-      if (nota) { out.com_nota++; if (out.exemplos.length < 30) out.exemplos.push({ id: c.id, name: n }); }
+      if (nota) { out.com_nota++; if (out.exemplos.length < 3000) out.exemplos.push({ id: c.id, name: n }); }
     }
     pag++;
     if (!r?._links?.next) { out.fim = true; break; }
