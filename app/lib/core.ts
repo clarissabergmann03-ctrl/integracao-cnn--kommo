@@ -5459,6 +5459,39 @@ async function handleDebugObs(req: Request, env: Env): Promise<Response> {
   return Response.json(out);
 }
 
+// ══ /debug-listar-etapa — lista os leads numa etapa (pipeline+status), com AGENDAMENTO/ID Agenda e flag
+// se a agenda é PASSADA. READ-ONLY. Serve p/ auditar a "Confirmação de Consulta" (achar presos/errados).
+async function handleDebugListarEtapa(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const pipeline = url.searchParams.get("pipeline") ?? String(PIPELINE_CAPTACAO);
+  const status = url.searchParams.get("status") ?? "107785399"; // Confirmação de Consulta (F.Captura)
+  const t0 = Date.now();
+  const fields = await resolveFields(env);
+  const fAg = fields["AGENDAMENTO"], fIdAgenda = fields["ID Agenda CNN"], fIdPac = fields["ID Paciente CNN"];
+  const agora = Math.floor(Date.now() / 1000);
+  const out: any = { pipeline, status, total: 0, passados: 0, sem_agendamento: 0, leads: [] as any[] };
+  let pag = 1;
+  while (Date.now() - t0 < 200000) {
+    let r: any;
+    try { r = await kommoGet(`/leads?filter[statuses][0][pipeline_id]=${pipeline}&filter[statuses][0][status_id]=${status}&limit=250&page=${pag}`, env); }
+    catch (e) { out.erro = String(e).slice(0, 140); break; }
+    const leads = r?._embedded?.leads ?? [];
+    if (!leads.length) { break; }
+    for (const l of leads) {
+      out.total++;
+      const agTs = Number(getFieldValue(l, fAg) ?? 0);
+      const d = agTs ? unixToDateBRT(agTs) : null;
+      const passado = !!agTs && agTs < agora;
+      if (passado) out.passados++;
+      if (!agTs) out.sem_agendamento++;
+      if (out.leads.length < 120) out.leads.push({ lead: l.id, nome: l.name, pid: getFieldValue(l, fIdPac), agendamento: d ? `${d.data} ${d.hora}` : null, id_agenda: getFieldValue(l, fIdAgenda), passado });
+    }
+    if (!r?._links?.next) break;
+    pag++;
+  }
+  return Response.json(out);
+}
+
 // ══ /debug-investigar — por TELEFONE: acha o(s) lead(s) no Kommo (etapa + AGENDAMENTO + ID Agenda) e
 // cruza com as agendas do CNN (janela −30/+90d, ordenadas por data+hora). READ-ONLY. Serve p/ investigar
 // casos de confirmação errada (horário/agenda passada/reagendamento).
@@ -6117,6 +6150,12 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
       if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
       resetSubreq();
       return handleDebugInvestigar(req, env);
+    }
+
+    if (pathname === "/debug-listar-etapa") { // lista leads numa etapa (pipeline+status) c/ AGENDAMENTO, flag passado — READ-ONLY
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      resetSubreq();
+      return handleDebugListarEtapa(req, env);
     }
 
     if (pathname === "/debug-backfill-preview") {
