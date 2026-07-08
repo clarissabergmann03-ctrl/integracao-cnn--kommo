@@ -6462,8 +6462,8 @@ export async function handleScheduled(event: ScheduledEvent, env: Env, ctx: Exec
         if (day >= 1 && day <= 5 && hour === 11 && min === 30) {
           prod.vespera = await produtorVespera(env, target, tomorrowBRT());   // Seg–Sex 8h30 BRT (11h30 UTC) → D+1
           gatilhos.push("vespera-d1");
-        } else if (day === 6 && hour === 14 && min === 0) {
-          prod.vespera = await produtorVespera(env, target, nextMondayBRT()); // Sáb 11h BRT → segunda
+        } else if (day === 6 && hour === 11 && min === 30) {
+          prod.vespera = await produtorVespera(env, target, nextMondayBRT()); // Sáb 8h30 BRT (11h30 UTC) → confirma agendamentos de segunda
           gatilhos.push("vespera-seg");
         }
         // Item 3 — Sync de base CNN→Kommo (janela −2/+14, produtor a cada 10 min)
