@@ -5459,6 +5459,60 @@ async function handleDebugObs(req: Request, env: Env): Promise<Response> {
   return Response.json(out);
 }
 
+// ══ /debug-check-confirmacao — auditoria + correção da etapa "Confirmação de Consulta". Pra cada lead:
+// acha o agendamento MAIS CEDO do dia (não-terminal, não-passado) do paciente e compara com o AGENDAMENTO
+// do card. Sinaliza: horario_errado (não é o 1º do dia), duplicata_dupla (2+ cards do MESMO pid na etapa),
+// passado_ou_stale (sem agenda vigente no dia = cancelada/reagendada). modo=fix (dry por padrão) corrige o
+// AGENDAMENTO + ID Agenda p/ o 1º do dia. NÃO move card nem confirma — só acerta o dado do horário.
+async function handleDebugCheckConfirmacao(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const dry = url.searchParams.get("dry") !== "0";
+  const pipeline = url.searchParams.get("pipeline") ?? String(PIPELINE_CAPTACAO);
+  const status = url.searchParams.get("status") ?? "107785399";
+  const t0 = Date.now();
+  const fields = await resolveFields(env);
+  const fAg = fields["AGENDAMENTO"], fIdAgenda = fields["ID Agenda CNN"], fIdPac = fields["ID Paciente CNN"];
+  const tiposMap = await resolveTiposConsulta(env, "production");
+  const agora = Math.floor(Date.now() / 1000);
+  const leads: any[] = [];
+  let pag = 1;
+  while (true) {
+    let r: any;
+    try { r = await kommoGet(`/leads?filter[statuses][0][pipeline_id]=${pipeline}&filter[statuses][0][status_id]=${status}&limit=250&page=${pag}`, env); }
+    catch { break; }
+    const ls = r?._embedded?.leads ?? [];
+    if (!ls.length) break;
+    for (const l of ls) leads.push({ id: String(l.id), name: l.name, pid: getFieldValue(l, fIdPac), agTs: Number(getFieldValue(l, fAg) ?? 0), agenda: getFieldValue(l, fIdAgenda) });
+    if (!r?._links?.next) break; pag++;
+  }
+  const porPid: Record<string, string[]> = {};
+  for (const l of leads) if (l.pid) (porPid[l.pid] ??= []).push(l.id);
+  const out: any = { total: leads.length, dry,
+    duplicata_dupla: Object.entries(porPid).filter(([, ls]) => ls.length > 1).map(([pid, ls]) => ({ pid, leads: ls })),
+    horario_errado: [] as any[], passado_ou_stale: [] as any[], corrigidos: 0 };
+  for (const l of leads) {
+    if (Date.now() - t0 > 240000) { out.parou_tempo = true; break; }
+    if (!l.pid || !l.agTs) continue;
+    const d = unixToDateBRT(l.agTs); const dia = d.data;
+    let ags: any[] = [];
+    try { const ra: any = await cnnGet(`/agenda/lista?codigoPaciente=${l.pid}&dataInicial=${dia}&dataFinal=${dia}&registrosPorPagina=200&pagina=0`, env, "production"); ags = ra?.lista ?? []; } catch { continue; }
+    const doDia = ags.filter((a: any) => a.data === dia && !STATUS_TERMINAL.has(a.status ?? "") && !isTarefaInterna(a))
+      .map((a: any) => ({ id: String(a.id), ts: (a.data && a.horaInicio) ? brtToUnix(a.data, a.horaInicio.slice(0, 5)) : 0, grupo: grupoDaAgenda(a, tiposMap), hora: String(a.horaInicio ?? "").slice(0, 5) }))
+      .filter((a: any) => a.ts >= agora - 3600)
+      .sort((x: any, y: any) => x.ts - y.ts);
+    if (!doDia.length) { out.passado_ou_stale.push({ lead: l.id, name: l.name, agendamento: `${d.data} ${d.hora}`, agenda: l.agenda, motivo: "sem agenda vigente no dia (cancelada/reagendada/passada)" }); continue; }
+    const first = doDia[0];
+    if (String(l.agenda) !== first.id || Math.abs(l.agTs - first.ts) > 60) {
+      out.horario_errado.push({ lead: l.id, name: l.name, atual: `${d.data} ${d.hora} (ag ${l.agenda})`, correto: `${dia} ${first.hora} (ag ${first.id}, grupo ${first.grupo})` });
+      if (!dry) {
+        try { await kommoPatch(`/leads/${l.id}`, { custom_fields_values: [{ field_id: fAg, values: [{ value: first.ts }] }, { field_id: fIdAgenda, values: [{ value: first.id }] }] }, env); out.corrigidos++; }
+        catch (e) { out.erros = (out.erros ?? 0) + 1; }
+      }
+    }
+  }
+  return Response.json(out);
+}
+
 // ══ /debug-listar-etapa — lista os leads numa etapa (pipeline+status), com AGENDAMENTO/ID Agenda e flag
 // se a agenda é PASSADA. READ-ONLY. Serve p/ auditar a "Confirmação de Consulta" (achar presos/errados).
 async function handleDebugListarEtapa(req: Request, env: Env): Promise<Response> {
@@ -6174,6 +6228,12 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
       if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
       resetSubreq();
       return handleDebugListarEtapa(req, env);
+    }
+
+    if (pathname === "/debug-check-confirmacao") { // audita a etapa Confirmação: horário errado (não-1º do dia) + duplicata-dupla + passado/reagendado. modo fix corrige AGENDAMENTO→1º do dia
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      resetSubreq();
+      return handleDebugCheckConfirmacao(req, env);
     }
 
     if (pathname === "/debug-backfill-preview") {
