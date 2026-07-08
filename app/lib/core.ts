@@ -5384,9 +5384,10 @@ async function handleDebugObs(req: Request, env: Env): Promise<Response> {
   if (!obsField) return Response.json({ erro: "campo Observações: não existe — rode /debug-criar-obs primeiro" }, { status: 400 });
   const reNaoAgendar = /n[ãa]o\s*agendar/i, reAnot = /\([^)]{3,}\)|\s[-–]\s|n[ãa]o\s*agendar|jamais|remarcar/i;
   const bate = (n: string) => filtro === "todos" ? reAnot.test(n) : reNaoAgendar.test(n);
+  const maxPatch = Math.max(1, Number(url.searchParams.get("maxpatch") ?? "100") || 100); // cap de escritas/chamada p/ caber no maxDuration
   const out: any = { modo, dry, filtro, pagina_ini: pagIni, contatos: 0, atingidos: 0, movidos: 0, revisar: 0, erros: 0, proxima_pagina: pagIni, fim: false, amostra: [] as any[] };
-  let pag = pagIni;
-  while (Date.now() - t0 < 250000) {
+  let pag = pagIni, parar = false;
+  while (!parar && Date.now() - t0 < 200000) {
     let r: any;
     try { r = await kommoGet(`/contacts?limit=250&page=${pag}`, env); }
     catch (e) { out.erro = String(e).slice(0, 140); break; }
@@ -5408,11 +5409,13 @@ async function handleDebugObs(req: Request, env: Env): Promise<Response> {
         out.movidos++;
         if (out.amostra.length < 40) out.amostra.push({ id: c.id, nome: revisar ? "(mantido p/ revisar)" : limpo });
       } catch (e) { out.erros++; if (out.amostra.length < 40) out.amostra.push({ id: c.id, erro: String(e).slice(0, 120) }); }
+      if (!dry && out.movidos >= maxPatch) { parar = true; out.limite_patch = true; break; } // para p/ caber no tempo; retoma nesta página
     }
+    if (parar) { out.proxima_pagina = pag; break; }              // re-scan da mesma pág: já-limpos são pulados (idempotente)
     pag++;
     if (!r?._links?.next) { out.fim = true; break; }
   }
-  out.proxima_pagina = pag;
+  if (!parar) out.proxima_pagina = pag;
   return Response.json(out);
 }
 
