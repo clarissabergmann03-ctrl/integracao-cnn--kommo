@@ -2414,6 +2414,16 @@ async function consumirItemF2(item: any, env: Env, target: CnnTarget, dryRun: bo
   // Detecção pelo próprio card (D1, sem subrequest); mesma condição que gera o [Familia].
   const nPac = await env.DB.prepare(`SELECT COUNT(DISTINCT paciente_id_cnn) n FROM mapeamento WHERE lead_id_kommo=?`).bind(leadId).first<any>();
   if (Number(nPac?.n ?? 0) >= 2) return { r: "pulado_familia", leadId };
+  // GUARDRAIL item 2 (dono 08/07): "Confirmação de Consulta" é etapa SENSÍVEL — NUNCA confirmar agenda
+  // passada ou terminal (cancelada/faltou/finalizada). Re-checa no CONSUMO porque a agenda pode ter sido
+  // cancelada/reagendada entre o enfileiramento da véspera e o consumo (ainda mais com o lote que atrasa).
+  if (data < todayBRT()) return { r: "pulado_passado", leadId };
+  try {
+    const ra: any = await cnnGet(`/agenda/lista?codigoPaciente=${item.paciente_id_cnn}&dataInicial=${data}&dataFinal=${data}&registrosPorPagina=200&pagina=0`, env, target);
+    const ag = (ra?.lista ?? []).find((a: any) => String(a.id) === String(item.agenda_id_cnn));
+    if (!ag) return { r: "pulado_agenda_sumiu", leadId };            // reagendada/removida → não confirma
+    if (STATUS_TERMINAL.has(ag.status ?? "")) return { r: "pulado_terminal", leadId };
+  } catch { /* falha de leitura CNN: não bloqueia (o filtro da véspera já cobriu no enfileiramento) */ }
   const dest = VESPERA_DESTINO[grupo];
   if (!dryRun) {
     await moveLeadToStage(leadId, dest.etapa, env, dest.pipeline);
@@ -2623,6 +2633,14 @@ async function consumirFila(env: Env, target: CnnTarget, dryRun: boolean, cap: n
   // Dry-run só ESPIA (não muta a fila). Caminho real REIVINDICA (claim atômico) → drenos
   // concorrentes puxam conjuntos disjuntos (C1).
   const lote = dryRun ? await filaPuxarPendentes(cap, env) : await filaClaimLote(cap, env);
+  // Item 5 (dono 08/07): LOTEAR a confirmação — no máx 5 jobs F2 (moves p/ "Confirmação de Consulta")
+  // a cada 2 min. O salesbot buga qdo muitos leads entram na etapa de uma vez (a régua das 8h30 enfileira
+  // dezenas). Gate por cursor f2_lote_ts: abre a janela a cada 120s e libera até 5; o resto volta à fila.
+  const F2_LOTE_MAX = 5, F2_LOTE_INTERVALO_S = 120;
+  const agoraSegFila = Math.floor(Date.now() / 1000);
+  const f2UltimoTs = Number((await getCursor("f2_lote_ts", env)) ?? "0");
+  let f2Permitido = (agoraSegFila - f2UltimoTs >= F2_LOTE_INTERVALO_S) ? F2_LOTE_MAX : 0;
+  let f2Feitos = 0;
   for (let i = 0; i < lote.length; i++) {
     const item = lote[i];
     if (!orcamentoOk(budget)) {
@@ -2631,6 +2649,10 @@ async function consumirFila(env: Env, target: CnnTarget, dryRun: boolean, cap: n
       // volta a 'pendente' sem queimar tentativa (senão ficaria presa em 'processing' até o TTL).
       if (!dryRun) for (let k = i; k < lote.length; k++) await filaAdiar(lote[k].id, env);
       break;
+    }
+    if (item.tipo === "F2") { // gate do lote (item 5): fora da janela ou já liberou 5 → devolve à fila
+      if (f2Permitido <= 0) { if (!dryRun) await filaAdiar(item.id, env); out.f2_lote_adiado = (out.f2_lote_adiado ?? 0) + 1; continue; }
+      f2Permitido--; f2Feitos++;
     }
     try {
       let res: { r: string; leadId?: string; nome?: string } = { r: "tipo_desconhecido" };
@@ -2681,6 +2703,8 @@ async function consumirFila(env: Env, target: CnnTarget, dryRun: boolean, cap: n
       out.itens.push({ id: item.id, pac: item.paciente_id_cnn, erro: String(e), transitorio, dead_letter: deadLetter });
     }
   }
+  if (!dryRun && f2Feitos > 0) await setCursor("f2_lote_ts", String(agoraSegFila), env); // abre a próxima janela do lote em +120s
+  out.f2_feitos = f2Feitos;
   return out;
 }
 
