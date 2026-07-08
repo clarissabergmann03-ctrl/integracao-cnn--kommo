@@ -5459,6 +5459,54 @@ async function handleDebugObs(req: Request, env: Env): Promise<Response> {
   return Response.json(out);
 }
 
+// ══ /debug-investigar — por TELEFONE: acha o(s) lead(s) no Kommo (etapa + AGENDAMENTO + ID Agenda) e
+// cruza com as agendas do CNN (janela −30/+90d, ordenadas por data+hora). READ-ONLY. Serve p/ investigar
+// casos de confirmação errada (horário/agenda passada/reagendamento).
+async function handleDebugInvestigar(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const tel = (url.searchParams.get("telefone") ?? "").replace(/\D/g, "");
+  if (tel.length < 8) return Response.json({ erro: "telefone inválido (min 8 dígitos)" }, { status: 400 });
+  const target: CnnTarget = "production";
+  const fields = await resolveFields(env);
+  const fIdPac = fields["ID Paciente CNN"], fAg = fields["AGENDAMENTO"], fIdAgenda = fields["ID Agenda CNN"], fInativo = fields["Inativo"];
+  const tiposMap = await resolveTiposConsulta(env, target);
+  const out: any = { telefone: tel, contatos: [] as any[], cnn: {} as any };
+  const pids = new Set<string>();
+  try {
+    const kr: any = await kommoGet(`/contacts?query=${encodeURIComponent(tel.slice(-8))}&with=leads`, env);
+    for (const c of (kr._embedded?.contacts ?? [])) {
+      const leads: any[] = [];
+      for (const lref of (c._embedded?.leads ?? [])) {
+        try {
+          const l: any = await kommoGet(`/leads/${lref.id}`, env);
+          const pid = getFieldValue(l, fIdPac);
+          if (pid) pids.add(String(pid));
+          const agTs = Number(getFieldValue(l, fAg) ?? 0);
+          const d = agTs ? unixToDateBRT(agTs) : null;
+          leads.push({ lead: l.id, pipeline: l.pipeline_id, stage: l.status_id, nome: l.name, pid: pid ?? null,
+            agendamento: d ? `${d.data} ${d.hora}` : null, id_agenda_cnn: getFieldValue(l, fIdAgenda),
+            inativo: fInativo ? getFieldValue(l, fInativo) : null });
+        } catch (e) { leads.push({ lead: lref.id, erro: String(e).slice(0, 80) }); }
+      }
+      out.contatos.push({ contato: c.id, nome: c.name, leads });
+    }
+  } catch (e) { out.erro_kommo = String(e).slice(0, 120); }
+  const di = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+  const df = new Date(Date.now() + 90 * 86400000).toISOString().slice(0, 10);
+  for (const pid of pids) {
+    const ags: any[] = [];
+    let pag = 0, tot = 1;
+    while (pag < tot && orcamentoOk(45)) {
+      let r: any; try { r = await cnnGet(`/agenda/lista?codigoPaciente=${pid}&dataInicial=${di}&dataFinal=${df}&registrosPorPagina=200&pagina=${pag}`, env, target); } catch { break; }
+      for (const a of (r?.lista ?? [])) ags.push(a);
+      tot = Math.max(r?.totalPaginas ?? 1, 1); pag++;
+    }
+    out.cnn[pid] = ags.map((a: any) => ({ id: a.id, data: a.data, hora: String(a.horaInicio ?? "").slice(0, 5), status: a.status, grupo: grupoDaAgenda(a, tiposMap) }))
+      .sort((x: any, y: any) => (`${x.data} ${x.hora}` < `${y.data} ${y.hora}` ? -1 : 1));
+  }
+  return Response.json(out);
+}
+
 // ══ /debug-nome-base — survey/fix do NOME na BASE INTEIRA do Kommo (pagina /leads: inclui ganho/perdido/
 // sem-vínculo), diferente do /debug-nome (só mapeamento/ativos). Nome real: se tem ID Paciente CNN →
 // cnnPacienteNome; senão usa o nome do contato (se bom). Preserva sufixo "(duplicata)" existente.
@@ -6063,6 +6111,12 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
         const cfs = (c.custom_fields_values ?? []).map((f: any) => ({ campo: f.field_name, id: f.field_id, valor: f.values?.[0]?.value }));
         return Response.json({ id, name: c.name, campos: cfs });
       } catch (e) { return Response.json({ erro: String(e) }, { status: 502 }); }
+    }
+
+    if (pathname === "/debug-investigar") { // por telefone: lead Kommo (AGENDAMENTO/ID Agenda/etapa) + agendas CNN — READ-ONLY
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      resetSubreq();
+      return handleDebugInvestigar(req, env);
     }
 
     if (pathname === "/debug-backfill-preview") {
