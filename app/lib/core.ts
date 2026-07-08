@@ -5369,7 +5369,7 @@ function extrairFamilia(nomeOrig: string): string | null {
   const paren = /\(([^)]+)\)/.exec(n);
   if (paren) pac = paren[1];
   else pac = n.replace(/^(m[ãa]e|esposa|marid\w*|espos\w*|pai|filh\w*|irm\w+|sogr\w*|av[óo]|tia|tio|respons\w*)\s*(do\s*paciente|do|da|de)?\s*[-–:]*\s*/i, "");
-  pac = pac.replace(/\bpaciente\b/gi, "").replace(/[.()]/g, "").replace(/\s+/g, " ").trim();
+  pac = pac.replace(/\bpaciente\b/gi, "").replace(/[.()]/g, "").replace(/^[-–:\s]+|[-–:\s]+$/g, "").replace(/\s+/g, " ").trim();
   if ((pac.match(/[a-zà-ú]/gi) || []).length < 3) return null;
   return tituloNome(pac) + " [Familia]";
 }
