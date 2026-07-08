@@ -5469,9 +5469,13 @@ async function handleDebugListarEtapa(req: Request, env: Env): Promise<Response>
   const fields = await resolveFields(env);
   const fAg = fields["AGENDAMENTO"], fIdAgenda = fields["ID Agenda CNN"], fIdPac = fields["ID Paciente CNN"];
   const agora = Math.floor(Date.now() / 1000);
-  const out: any = { pipeline, status, total: 0, passados: 0, sem_agendamento: 0, leads: [] as any[] };
+  const comGrupo = url.searchParams.get("grupo") === "1"; // cruza o GRUPO real (A/B) da agenda no CNN
+  const tiposMap = comGrupo ? await resolveTiposConsulta(env, "production") : null;
+  const di = new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
+  const df = new Date(Date.now() + 120 * 86400000).toISOString().slice(0, 10);
+  const out: any = { pipeline, status, total: 0, passados: 0, sem_agendamento: 0, grupo_A: 0, grupo_B: 0, grupo_indef: 0, leads: [] as any[] };
   let pag = 1;
-  while (Date.now() - t0 < 200000) {
+  while (Date.now() - t0 < 240000) {
     let r: any;
     try { r = await kommoGet(`/leads?filter[statuses][0][pipeline_id]=${pipeline}&filter[statuses][0][status_id]=${status}&limit=250&page=${pag}`, env); }
     catch (e) { out.erro = String(e).slice(0, 140); break; }
@@ -5484,7 +5488,21 @@ async function handleDebugListarEtapa(req: Request, env: Env): Promise<Response>
       const passado = !!agTs && agTs < agora;
       if (passado) out.passados++;
       if (!agTs) out.sem_agendamento++;
-      if (out.leads.length < 120) out.leads.push({ lead: l.id, nome: l.name, pid: getFieldValue(l, fIdPac), agendamento: d ? `${d.data} ${d.hora}` : null, id_agenda: getFieldValue(l, fIdAgenda), passado });
+      const pid = getFieldValue(l, fIdPac), idAg = getFieldValue(l, fIdAgenda);
+      let grupo: string | null = null;
+      if (comGrupo && pid && idAg) {
+        try {
+          let pg = 0, tot = 1, match: any = null;
+          while (pg < tot && !match && orcamentoOk(45)) {
+            const ra: any = await cnnGet(`/agenda/lista?codigoPaciente=${pid}&dataInicial=${di}&dataFinal=${df}&registrosPorPagina=200&pagina=${pg}`, env, "production");
+            match = (ra?.lista ?? []).find((a: any) => String(a.id) === String(idAg));
+            tot = Math.max(ra?.totalPaginas ?? 1, 1); pg++;
+          }
+          grupo = match ? (grupoDaAgenda(match, tiposMap!) ?? "?") : "nao_achou";
+          if (grupo === "A") out.grupo_A++; else if (grupo === "B") out.grupo_B++; else out.grupo_indef++;
+        } catch { grupo = "erro"; }
+      }
+      if (out.leads.length < 120) out.leads.push({ lead: l.id, nome: l.name, pid, agendamento: d ? `${d.data} ${d.hora}` : null, id_agenda: idAg, passado, grupo });
     }
     if (!r?._links?.next) break;
     pag++;
