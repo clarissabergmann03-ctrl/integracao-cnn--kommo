@@ -5290,11 +5290,11 @@ async function handleContarLeads(req: Request, env: Env): Promise<Response> {
   const t0 = Date.now();
   const fields = await resolveFields(env);
   const fIdPac = fields["ID Paciente CNN"];
-  const out: any = { pagina_ini: pagIni, paginas_lidas: 0, leads: 0, com_cnn: 0, sem_cnn: 0, por_pipeline: {} as any, por_status: {} as any, proxima_pagina: pagIni, fim: false };
+  const out: any = { pagina_ini: pagIni, paginas_lidas: 0, leads: 0, com_cnn: 0, sem_cnn: 0, sem_cnn_tag: {} as any, por_pipeline: {} as any, por_status: {} as any, por_tag: {} as any, por_ano: {} as any, proxima_pagina: pagIni, fim: false };
   let pag = pagIni;
   while (Date.now() - t0 < 250000) {
     let r: any;
-    try { r = await kommoGet(`/leads?limit=250&page=${pag}`, env); }
+    try { r = await kommoGet(`/leads?limit=250&page=${pag}&with=source_id`, env); }
     catch (e) { out.erro = String(e).slice(0, 140); break; }
     const leads = r?._embedded?.leads ?? [];
     if (!leads.length) { out.fim = true; break; }
@@ -5304,7 +5304,13 @@ async function handleContarLeads(req: Request, env: Env): Promise<Response> {
       const pl = String(l.pipeline_id), st = String(l.status_id);
       out.por_pipeline[pl] = (out.por_pipeline[pl] ?? 0) + 1;
       out.por_status[st] = (out.por_status[st] ?? 0) + 1;
-      if (getFieldValue(l, fIdPac)) out.com_cnn++; else out.sem_cnn++;
+      const temCnn = !!getFieldValue(l, fIdPac);
+      if (temCnn) out.com_cnn++; else out.sem_cnn++;
+      const tags = (l._embedded?.tags ?? []).map((t: any) => String(t.name));
+      for (const tg of tags) { out.por_tag[tg] = (out.por_tag[tg] ?? 0) + 1; if (!temCnn) out.sem_cnn_tag[tg] = (out.sem_cnn_tag[tg] ?? 0) + 1; }
+      if (!tags.length) { out.por_tag["(sem tag)"] = (out.por_tag["(sem tag)"] ?? 0) + 1; if (!temCnn) out.sem_cnn_tag["(sem tag)"] = (out.sem_cnn_tag["(sem tag)"] ?? 0) + 1; }
+      const ano = l.created_at ? new Date(l.created_at * 1000).getUTCFullYear() : 0;
+      out.por_ano[String(ano)] = (out.por_ano[String(ano)] ?? 0) + 1;
     }
     pag++;
     if (!r?._links?.next) { out.fim = true; break; }
