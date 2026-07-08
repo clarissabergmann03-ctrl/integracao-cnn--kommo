@@ -2359,38 +2359,38 @@ async function produtorVespera(env: Env, target: CnnTarget, dataAlvo?: string, s
 
   const agSync = await getAgendaSyncMap(env);
   const mapLead = await getMapeamentoLeadMap(env);
-  // Anti-spam (§6): agrupa por PACIENTE → quais grupos têm agenda no dia-alvo (a 1ª de cada
-  // grupo = mais próxima, lista vem ordenada por hora). A+B no MESMO dia → confirma só o card
-  // de Captação (A) → 1 WhatsApp (o de Pós-Venda fica Cliente Ativo). Dias diferentes cada
-  // card cai numa execução de véspera diferente, então naturalmente confirma o seu.
-  const porPac = new Map<string, { A?: string; B?: string }>(); // pid → agendaId por grupo
+  // Item 1/6 (dono 08/07): agrupa TODAS as agendas do dia por PACIENTE e confirma SÓ a MAIS CEDO
+  // (menor hora) não-terminal — 1 WhatsApp por paciente, no PRIMEIRO horário do dia, no card do
+  // GRUPO da agenda vencedora (o outro card fica onde está). Substitui o antigo "A vence no mesmo dia"
+  // (que ignorava a hora → confirmava o horário mais TARDE quando a A era depois da B; bug Edinar/12:30×13:30).
+  const porPac = new Map<string, Array<{ agendaId: string; grupo: "A" | "B"; ts: number }>>();
   for (const a of todas) {
     if (a.data !== amanha) continue;
     if (isTarefaInterna(a)) { out.pulados_interno++; continue; }
-    if (STATUS_TERMINAL.has(a.status ?? "")) { out.pulados_status++; continue; }
+    if (STATUS_TERMINAL.has(a.status ?? "")) { out.pulados_status++; continue; } // guardrail item 2: nunca confirma terminal
     const grupo = grupoDaAgenda(a, tiposMap);
     if (!grupo) { out.pulados_tipo++; continue; }
     const pid = String(a.idPaciente ?? "");
     if (!pid) continue;
-    const p = porPac.get(pid) ?? {};
-    if (!p[grupo]) p[grupo] = String(a.id);
-    porPac.set(pid, p);
+    const ts = (a.data && a.horaInicio) ? brtToUnix(a.data, a.horaInicio.slice(0, 5)) : 0;
+    const arr = porPac.get(pid) ?? [];
+    arr.push({ agendaId: String(a.id), grupo, ts });
+    porPac.set(pid, arr);
   }
 
   const aEnfileirar: any[] = [];
-  for (const [pid, grupos] of porPac) {
+  for (const [pid, ags] of porPac) {
     if (soPid && pid !== soPid) continue; // validação escopada: só o paciente de teste (blast radius = 1)
-    const alvos: Array<"A" | "B"> = grupos.A ? ["A"] : ["B"]; // A vence no mesmo dia (anti-spam); senão o grupo presente
-    for (const g of alvos) {
-      const agendaId = grupos[g]!;
-      const leadId = agSync.get(agendaId)?.lead ?? mapLead.get(mapeamentoKey(pid, g));
-      if (!leadId) { out.nao_mapeado++; continue; }
-      if (await leadJaLembradoNaData(leadId, amanha, env)) { out.ja_lembrado++; continue; }
-      aEnfileirar.push({
-        chave: `F2:lead:${leadId}:${amanha}`, tipo: "F2", agenda_id_cnn: agendaId, paciente_id_cnn: pid, grupo: g,
-        payload: { leadId, data: amanha },
-      });
-    }
+    // MAIS CEDO do dia: menor ts com hora (>0); agendas sem hora (ts=0) só se não houver com hora.
+    const venc = ags.slice().sort((x, y) => (x.ts || Infinity) - (y.ts || Infinity))[0];
+    const g = venc.grupo, agendaId = venc.agendaId;
+    const leadId = agSync.get(agendaId)?.lead ?? mapLead.get(mapeamentoKey(pid, g));
+    if (!leadId) { out.nao_mapeado++; continue; }
+    if (await leadJaLembradoNaData(leadId, amanha, env)) { out.ja_lembrado++; continue; }
+    aEnfileirar.push({
+      chave: `F2:lead:${leadId}:${amanha}`, tipo: "F2", agenda_id_cnn: agendaId, paciente_id_cnn: pid, grupo: g,
+      payload: { leadId, data: amanha },
+    });
   }
   const antes = (await filaStats(env)).pendente ?? 0;
   if (aEnfileirar.length) await filaEnfileirarLote(aEnfileirar, env);
