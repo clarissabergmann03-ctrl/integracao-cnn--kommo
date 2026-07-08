@@ -5313,6 +5313,40 @@ async function handleContarLeads(req: Request, env: Env): Promise<Response> {
   return Response.json(out);
 }
 
+// ══ /debug-notas-contato — mede anotações da equipe embutidas no NOME do contato (ex.: "NÃO AGENDAR",
+// preço, instruções entre parênteses/traço). READ-ONLY. Pagina /contacts (250/pág). Serve pra decidir
+// se ao renomear o lead a gente PRESERVA ou EXTRAI essas notas antes de mexer.
+async function handleDebugNotas(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const pagIni = Math.max(1, Number(url.searchParams.get("pagina") ?? "1") || 1);
+  const t0 = Date.now();
+  const out: any = { pagina_ini: pagIni, contatos: 0, com_nota: 0, nao_agendar: 0, com_parenteses: 0, com_traco: 0, com_valor: 0, longos: 0, proxima_pagina: pagIni, fim: false, exemplos: [] as any[] };
+  const reNaoAgendar = /n[ãa]o\s*agendar/i, reParen = /\([^)]{3,}\)/, reTraco = /\s[-–]\s/, reValor = /\bR?\$?\s?\d{3,4}\b/;
+  let pag = pagIni;
+  while (Date.now() - t0 < 250000) {
+    let r: any;
+    try { r = await kommoGet(`/contacts?limit=250&page=${pag}`, env); }
+    catch (e) { out.erro = String(e).slice(0, 140); break; }
+    const cs = r?._embedded?.contacts ?? [];
+    if (!cs.length) { out.fim = true; break; }
+    for (const c of cs) {
+      out.contatos++;
+      const n = String(c.name ?? "");
+      let nota = false;
+      if (reNaoAgendar.test(n)) { out.nao_agendar++; nota = true; }
+      if (reParen.test(n)) { out.com_parenteses++; nota = true; }
+      if (reTraco.test(n)) { out.com_traco++; nota = true; }
+      if (reValor.test(n)) { out.com_valor++; nota = true; }
+      if (n.length > 45) { out.longos++; nota = true; }
+      if (nota) { out.com_nota++; if (out.exemplos.length < 30) out.exemplos.push({ id: c.id, name: n }); }
+    }
+    pag++;
+    if (!r?._links?.next) { out.fim = true; break; }
+  }
+  out.proxima_pagina = pag;
+  return Response.json(out);
+}
+
 // ══ /debug-nome-base — survey/fix do NOME na BASE INTEIRA do Kommo (pagina /leads: inclui ganho/perdido/
 // sem-vínculo), diferente do /debug-nome (só mapeamento/ativos). Nome real: se tem ID Paciente CNN →
 // cnnPacienteNome; senão usa o nome do contato (se bom). Preserva sufixo "(duplicata)" existente.
@@ -5878,6 +5912,12 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
       if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
       resetSubreq();
       return handleDebugNomeBase(req, env);
+    }
+
+    if (pathname === "/debug-notas-contato") { // mede anotações da equipe embutidas no nome do contato — read-only
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      resetSubreq();
+      return handleDebugNotas(req, env);
     }
 
     if (pathname === "/debug-backfill-preview") {
