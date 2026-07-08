@@ -90,7 +90,7 @@ function destinoStatus(grupo: "A" | "B", statusEnum: string): number | null {
   const row = MAPA_STATUS[statusEnum];
   return row ? row[grupo] : null;
 }
-// Destino do move da véspera (Função 2, 15h BRT)
+// Destino do move da véspera (Função 2, 8h30 BRT)
 const VESPERA_DESTINO: Record<"A" | "B", { pipeline: number; etapa: number }> = {
   A: { pipeline: PIPELINE_CAPTACAO,  etapa: STAGE_CONFIRMACAO_CONSULTA },
   B: { pipeline: PIPELINE_POS_VENDA, etapa: STAGE_POS_CONFIRMACAO_AGEND },
@@ -1486,7 +1486,7 @@ async function handlePosVendaAgendar(req: Request, env: Env): Promise<Response> 
   return Response.json({ ok: true, enfileirado: "CNN_AGENDAR" });
 }
 
-// ── C1: Lembrete D-1 — roda às 15h BRT (18h UTC) ────────────────────────────
+// ── C1: Lembrete D-1 — roda às 8h30 BRT (11h30 UTC) ────────────────────────────
 // Move leads com consulta amanhã de "Consulta Agendada" para "Confirmação de Consulta".
 //
 // NOTA: o filtro server-side filter[cf][AGENDAMENTO][from/to] é IGNORADO pelo
@@ -6459,8 +6459,8 @@ export async function handleScheduled(event: ScheduledEvent, env: Env, ctx: Exec
       let tickErro: string | undefined;
       try {
         // Item 1 — Confirmação por horário (enfileira; o dreno abaixo move o lead)
-        if (day >= 1 && day <= 5 && hour === 18 && min === 0) {
-          prod.vespera = await produtorVespera(env, target, tomorrowBRT());   // Seg–Sex 15h BRT → D+1
+        if (day >= 1 && day <= 5 && hour === 11 && min === 30) {
+          prod.vespera = await produtorVespera(env, target, tomorrowBRT());   // Seg–Sex 8h30 BRT (11h30 UTC) → D+1
           gatilhos.push("vespera-d1");
         } else if (day === 6 && hour === 14 && min === 0) {
           prod.vespera = await produtorVespera(env, target, nextMondayBRT()); // Sáb 11h BRT → segunda
