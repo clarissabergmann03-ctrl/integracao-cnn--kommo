@@ -6014,6 +6014,17 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
       return handleDebugObs(req, env);
     }
 
+    if (pathname === "/debug-ler-contato") { // lê 1 contato (nome + custom fields) — verificação read-only
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      resetSubreq();
+      try {
+        const id = new URL(req.url).searchParams.get("id");
+        const c: any = await kommoGet(`/contacts/${id}`, env);
+        const cfs = (c.custom_fields_values ?? []).map((f: any) => ({ campo: f.field_name, id: f.field_id, valor: f.values?.[0]?.value }));
+        return Response.json({ id, name: c.name, campos: cfs });
+      } catch (e) { return Response.json({ erro: String(e) }, { status: 502 }); }
+    }
+
     if (pathname === "/debug-backfill-preview") {
       if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
       return handleDebugBackfillPreview(req, env);
