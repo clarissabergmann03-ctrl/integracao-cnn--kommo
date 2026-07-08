@@ -5353,6 +5353,69 @@ async function handleDebugNotas(req: Request, env: Env): Promise<Response> {
   return Response.json(out);
 }
 
+// Extrai {nome limpo, observação} de um nome de contato poluído com anotação. Conservador:
+// a observação SEMPRE guarda o nome ORIGINAL inteiro (zero perda). O nome limpo é best-effort;
+// se não der pra extrair com confiança, marca `revisar` e NÃO mexe no nome (só grava a obs).
+function extrairNomeObs(nomeOrig: string): { nome: string; obs: string; revisar: boolean } {
+  const obs = (nomeOrig ?? "").trim().replace(/\s+/g, " ");
+  let s = " " + (nomeOrig ?? "") + " ";
+  s = s.replace(/\([^)]*\)/g, " ");                                  // tira parênteses (já estão na obs)
+  const m = s.match(/\s[-–/]\s/);                                    // corta no 1º " - " / " / "
+  if (m && m.index !== undefined && m.index > 2) s = s.slice(0, m.index);
+  s = s.replace(/\b(n[ãa]o\s+agendar|nunca|jamais|pediu|sempre|passar|desmarca|bronzead|responder|dinheiro|valor|deixar|somente|remarcar|contato|insta|capilar|tatuagem|fisio|comercial|e-?mail|cliente|cod\b|particular|conv[êe]nio|medica|m[ãa]e|esposa|marido|pai\b)\b.*/i, "");
+  s = s.replace(/\bpi+\b/gi, "").replace(/[*!]+/g, "");              // marcadores PI/PIII, ! e *
+  let nome = s.replace(/\s+/g, " ").trim().replace(/^[-–/,.\s]+|[-–/,.\s]+$/g, "");
+  const letras = (nome.match(/[a-zà-ú]/gi) || []).length;
+  const revisar = letras < 3 || nome.length < 3;
+  if (revisar) nome = obs;                                          // não extraiu → mantém original
+  return { nome, obs, revisar };
+}
+// ══ /debug-obs — move a anotação do NOME do contato → campo "Observação" e limpa o nome. modo=survey
+// (read-only) | modo=fix (dry/real). filtro=naoagendar (padrão, piloto) | todos. Pagina /contacts.
+async function handleDebugObs(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const modo = url.searchParams.get("modo") ?? "survey";
+  const dry = url.searchParams.get("dry") !== "0";
+  const filtro = url.searchParams.get("filtro") ?? "naoagendar";
+  const pagIni = Math.max(1, Number(url.searchParams.get("pagina") ?? "1") || 1);
+  const t0 = Date.now();
+  const cf: any = await kommoGet("/contacts/custom_fields?limit=250", env);
+  const obsField = (cf._embedded?.custom_fields ?? []).find((f: any) => f.name === "Observação" || f.name === "Observacao");
+  if (!obsField) return Response.json({ erro: "campo Observação não existe — rode /debug-criar-obs primeiro" }, { status: 400 });
+  const reNaoAgendar = /n[ãa]o\s*agendar/i, reAnot = /\([^)]{3,}\)|\s[-–]\s|n[ãa]o\s*agendar|jamais|remarcar/i;
+  const bate = (n: string) => filtro === "todos" ? reAnot.test(n) : reNaoAgendar.test(n);
+  const out: any = { modo, dry, filtro, pagina_ini: pagIni, contatos: 0, atingidos: 0, movidos: 0, revisar: 0, erros: 0, proxima_pagina: pagIni, fim: false, amostra: [] as any[] };
+  let pag = pagIni;
+  while (Date.now() - t0 < 250000) {
+    let r: any;
+    try { r = await kommoGet(`/contacts?limit=250&page=${pag}`, env); }
+    catch (e) { out.erro = String(e).slice(0, 140); break; }
+    const cs = r?._embedded?.contacts ?? [];
+    if (!cs.length) { out.fim = true; break; }
+    for (const c of cs) {
+      out.contatos++;
+      const nome = String(c.name ?? "");
+      if (!bate(nome)) continue;
+      out.atingidos++;
+      const { nome: limpo, obs, revisar } = extrairNomeObs(nome);
+      if (revisar) out.revisar++;
+      if (modo === "survey") { if (out.amostra.length < 40) out.amostra.push({ id: c.id, de: nome, nome_limpo: limpo, obs, revisar }); continue; }
+      if (dry) { out.movidos++; if (out.amostra.length < 40) out.amostra.push({ id: c.id, de: nome, para_nome: limpo, para_obs: obs, revisar }); continue; }
+      try {
+        const body: any = { custom_fields_values: [{ field_id: obsField.id, values: [{ value: obs }] }] };
+        if (!revisar) body.name = limpo;                            // só limpa o nome se extraiu com confiança
+        await kommoPatch(`/contacts/${c.id}`, body, env);
+        out.movidos++;
+        if (out.amostra.length < 40) out.amostra.push({ id: c.id, nome: revisar ? "(mantido p/ revisar)" : limpo });
+      } catch (e) { out.erros++; if (out.amostra.length < 40) out.amostra.push({ id: c.id, erro: String(e).slice(0, 120) }); }
+    }
+    pag++;
+    if (!r?._links?.next) { out.fim = true; break; }
+  }
+  out.proxima_pagina = pag;
+  return Response.json(out);
+}
+
 // ══ /debug-nome-base — survey/fix do NOME na BASE INTEIRA do Kommo (pagina /leads: inclui ganho/perdido/
 // sem-vínculo), diferente do /debug-nome (só mapeamento/ativos). Nome real: se tem ID Paciente CNN →
 // cnnPacienteNome; senão usa o nome do contato (se bom). Preserva sufixo "(duplicata)" existente.
@@ -5924,6 +5987,25 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
       if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
       resetSubreq();
       return handleDebugNotas(req, env);
+    }
+
+    if (pathname === "/debug-criar-obs") { // cria o campo "Observação" (textarea) nos CONTATOS — idempotente
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      resetSubreq();
+      try {
+        const ex: any = await kommoGet("/contacts/custom_fields?limit=250", env);
+        const ja = (ex._embedded?.custom_fields ?? []).find((f: any) => f.name === "Observação" || f.name === "Observacao");
+        if (ja) return Response.json({ ok: true, criado: false, id: ja.id, nome: ja.name });
+        const r: any = await kommoPost("/contacts/custom_fields", [{ name: "Observação", type: "textarea" }], env);
+        const id = r?.[0]?.id ?? r?._embedded?.custom_fields?.[0]?.id ?? null;
+        return Response.json({ ok: true, criado: true, id });
+      } catch (e) { return Response.json({ ok: false, erro: String(e) }, { status: 502 }); }
+    }
+
+    if (pathname === "/debug-obs") { // extrai anotação do NOME do contato → campo Observação + limpa o nome
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      resetSubreq();
+      return handleDebugObs(req, env);
     }
 
     if (pathname === "/debug-backfill-preview") {
