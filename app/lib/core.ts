@@ -1091,6 +1091,14 @@ function decidirSupressao(
     a != null && b != null && Math.abs(Number(a) - Number(b)) <= 60;
   if (intent.tipo === "CNN_CONFIRMAR") {
     if (estado?.last_cnn_status === "CONFIRMADO_PACIENTE") return { executa: false, motivo: "ja_confirmado" };
+    // GUARD DE TERMINAL (13/07): agenda já FINALIZADA/CANCELADA/FALTOU não pode ser confirmada — o CNN
+    // devolve 400 "já foi alterado por outra pessoa" (PERMANENTE) → 4 tentativas → dead-letter. Era a
+    // causa dos 2 dead-letters vivos: as vítimas do bug do AGENDAMENTO defasado carregam no card o ID de
+    // uma agenda ANTIGA (já realizada); ao reconfirmarem, o webhook mirava essa agenda morta. O estado
+    // local JÁ SABIA (agenda_sync.last_cnn_status=FINALIZADO) — só ninguém perguntava. Espelha o guard que
+    // o consumirItemF2 ganhou em 5a12152; o caminho do webhook-1 nunca tinha recebido. Custo: 0 subrequest.
+    if (estado?.last_cnn_status && STATUS_TERMINAL.has(estado.last_cnn_status))
+      return { executa: false, motivo: `agenda_terminal_${estado.last_cnn_status.toLowerCase()}` };
     return { executa: true, motivo: "confirmar" };
   }
   // CNN_AGENDAR: retorno da confirmação → card já tem agenda E o horário não mudou → é o loop → suprime.
@@ -1164,7 +1172,20 @@ async function consumirItemCnnConfirmar(item: any, env: Env, dryRun: boolean): P
   }
   const est: any = await getAgendaSync(agendaId, env);
   const dec = decidirSupressao({ tipo: "CNN_CONFIRMAR" }, est);
-  if (!dec.executa) { if (!dryRun) await audit(env, { funcao: "CNN_CONFIRMAR", ambiente: "kommo", entidade_id: leadId, acao: "suprimido_ja_no_alvo", detalhe: dec.motivo }); return { r: "suprimido", leadId, nome: dec.motivo }; }
+  if (!dec.executa) {
+    // A supressão por agenda TERMINAL não é benigna como o anti-loop: o paciente CONFIRMOU e a
+    // confirmação NÃO foi gravada no CNN (o card aponta pra uma agenda morta). Não pode ser silenciosa —
+    // ação de audit própria + tarefa pra clínica corrigir o card (achado da revisão adversarial).
+    const terminal = dec.motivo.startsWith("agenda_terminal");
+    if (!dryRun) {
+      await audit(env, { funcao: "CNN_CONFIRMAR", ambiente: "kommo", entidade_id: leadId,
+        acao: terminal ? "suprimido_agenda_terminal" : "suprimido_ja_no_alvo", detalhe: dec.motivo });
+      if (terminal) await criarTarefaLead(leadId,
+        `O paciente CONFIRMOU, mas o card aponta pra agenda ${agendaId}, que no CNN já está ${String(est?.last_cnn_status ?? "?")}. A confirmação NÃO foi gravada no CNN. Corrija o "ID Agenda CNN" do card (a agenda certa é a próxima) e confirme à mão.`,
+        Math.floor(Date.now() / 1000) + 2 * 3600, env);
+    }
+    return { r: "suprimido", leadId, nome: dec.motivo };
+  }
   if (dryRun) return { r: "executaria", leadId, nome: "confirmar" };
   const wt = cnnWriteTarget(env);
   await cnnPut("/agenda/alteracao-status", { idAgenda: Number(agendaId), status: "CONFIRMADO_PACIENTE" }, env, wt);
@@ -1432,8 +1453,18 @@ async function handleConfirmacao(req: Request, env: Env): Promise<Response> {
   const est: any = await getAgendaSync(String(idAgenda), env);
   const dec = decidirSupressao({ tipo: "CNN_CONFIRMAR" }, est);
   if (!dec.executa) {
-    if (!dry) await audit(env, { funcao: "CNN_CONFIRMAR", ambiente: "kommo", entidade_id: leadId, acao: "suprimido_ja_no_alvo", detalhe: dec.motivo });
-    return Response.json({ ok: true, dry, suprimido: dec.motivo });
+    // Terminal ≠ anti-loop: aqui o paciente confirmou e a agenda do card está MORTA no CNN → tarefa
+    // pra clínica (senão a falha é silenciosa). O corpo da resposta mantém CONJUNTO FECHADO de valores
+    // em `suprimido` (o Salesbot lê essa resposta) — o status vai num campo separado.
+    const terminal = dec.motivo.startsWith("agenda_terminal");
+    if (!dry) {
+      await audit(env, { funcao: "CNN_CONFIRMAR", ambiente: "kommo", entidade_id: leadId,
+        acao: terminal ? "suprimido_agenda_terminal" : "suprimido_ja_no_alvo", detalhe: dec.motivo });
+      if (terminal) await criarTarefaLead(leadId,
+        `O paciente CONFIRMOU, mas o card aponta pra agenda ${idAgenda}, que no CNN já está ${String(est?.last_cnn_status ?? "?")}. A confirmação NÃO foi gravada no CNN. Corrija o "ID Agenda CNN" do card e confirme à mão.`,
+        Math.floor(Date.now() / 1000) + 2 * 3600, env);
+    }
+    return Response.json({ ok: true, dry, suprimido: terminal ? "agenda_terminal" : "ja_confirmado", status_agenda: est?.last_cnn_status ?? null });
   }
   const kommoTs = Number(getFieldValue(lead, fields["AGENDAMENTO"]) ?? 0);
   const chave = `CNN_CONFIRMAR:${idAgenda}:${kommoTs}`;
@@ -2138,6 +2169,26 @@ async function produtorSync(env: Env, target: CnnTarget, windowDays: number, soP
   const chavesSyncMudou: string[] = [];   // A3-REVERSÃO: chaves de sync que passaram no gate `mudou`
   const comVigenteA = new Set<string>();
 
+  // ⚠️ CICATRIZAÇÃO DO CROSS-FUNNEL: NÃO implementar reaproveitando a flag `baseline` (tentado e
+  // REVERTIDO em 13/07 — a revisão adversarial achou 2 bloqueadores). A linha de agenda_sync pode ter
+  // nascido apontando pro card do OUTRO funil (a migração gravava a 1ª agenda futura SEM filtrar grupo),
+  // e o gate abaixo — que só compara status e hora — nunca reescreve essa linha. É raiz REAL (do
+  // cross-funnel e do "AGENDAMENTO defasado"), mas a cura precisa de desenho PRÓPRIO:
+  //  (a) `baseline: !est || leadMudou` faz o consumidor cair no ramo baseline, que REESCREVE
+  //      AGENDAMENTO+ID Agenda com a agenda do nearestVigente — num card que pode estar NA ETAPA DE
+  //      CONFIRMAÇÃO → bypassa o "congela" (decidirHoraEmConfirmacao) e o seed do F2 → reintroduz o bug
+  //      da data errada no WhatsApp (o mesmo que o fix de 11/07 fechou);
+  //  (b) quando status E lead mudam juntos, o ramo baseline dá `return` ANTES do move de etapa e grava o
+  //      status novo → a mudança real de etapa é engolida PARA SEMPRE (o tick seguinte vê `sem_mudanca`);
+  //  (c) a chave da cura colide com a do job já 'feito' (status/ts não mudam numa cura pura) e a purga só
+  //      apaga gêmeo 'feito' — gêmeo em 'erro' bloqueia o INSERT pra sempre;
+  //  (d) o ramo baseline chama `alinharCardA`, que PUXA card de Cancelada/Perdido pra Consulta Agendada →
+  //      ressuscitaria em massa cards que a clínica fechou.
+  // Desenho correto (pendente): flag e CHAVE próprias (`A3:cura:…:${leadId}`), ramo próprio no
+  // consumirItemA3 que só reescreve o VÍNCULO (ID Agenda/ID Paciente + upsertAgendaSync) — nunca
+  // AGENDAMENTO sem passar por decidirHoraEmConfirmacao, nunca alinharCardA — e SEGUE o fluxo normal de
+  // hora/status em vez de retornar; + auditar cada cura (de qual card p/ qual card).
+
   // 2. Por (paciente, grupo): enfileira sync da agenda vigente (cria card se faltar).
   const enfileirarSync = (pid: string, grupo: "A" | "B", vig: Ag, temOutro: boolean) => {
     const leadId = mapLead.get(mapeamentoKey(pid, grupo));
@@ -2438,6 +2489,36 @@ async function produtorVespera(env: Env, target: CnnTarget, dataAlvo?: string, s
   return out;
 }
 
+// ── Guard de CONTATO (puro, testável) — bug Katia (dono 09/07), fechado em 13/07 ──────────────
+// O sistema sincroniza agenda→card, mas NUNCA atualiza o CONTATO do Kommo quando o paciente muda de
+// nome/telefone no CNN (não existe nenhum kommoPatch em /contacts no caminho do tick). Card ADOTADO
+// herda o contato antigo PARA SEMPRE. Caso real: Katia (pid 28321988) — o card ficou ligado ao contato
+// do MARIDO (tel 13991245192) e o Salesbot mandou a confirmação PRA ELE.
+// ⚠️ O gate é o TELEFONE, NÃO o nome — e checar só o nome seria PIOR que inútil nos dois sentidos:
+//  (a) NÃO PEGA o dano: no 2º card da Katia o contato tem o NOME CERTO dela e o telefone do marido.
+//  (b) PEGA QUEM NÃO DEVE: medido no preview contra a régua real de 14/07 — 3 dos 40 pacientes seriam
+//      bloqueados por nome com o TELEFONE CERTO: "Zuleika" vs CNN "Zuleica" (a mesma pessoa, grafia
+//      k/c), "Théo x Alexei" e "Marcelo" (parente cujo número É o número do paciente no CNN). Nesses,
+//      a mensagem chega no número que a clínica tem pro paciente — bloquear quebraria confirmação boa.
+// Logo: divergência de TELEFONE bloqueia (é pra ele que o WhatsApp vai); divergência de NOME é só
+// ALERTA (qualidade de dado, vira audit — nunca impede a confirmação).
+// Sem telefone no contato → NÃO bloqueia (sem número, o Salesbot não manda pra ninguém errado).
+// Sem telefone no CNN → não dá pra comparar → não bloqueia (não inventa divergência).
+// O telefone do CNN vem da agenda que o F2 acabou de reler → 0 subrequest a mais.
+function decidirContatoConfere(
+  cnnTel: string, cnnNome: string, contatoTels: string[], contatoNome: string
+): { ok: boolean; motivo: string; alertaNome: boolean } {
+  const toks = (s: string) => new Set(normNome(String(s ?? "").replace(/\(duplicata\)/ig, "")).split(/\s+/).filter((t) => t.length >= 3));
+  const tc = toks(contatoNome), tn = toks(cnnNome);
+  // Alerta (não bloqueia): ZERO token em comum. Primeiro-nome/abreviação NÃO conta como divergência.
+  const alertaNome = tc.size > 0 && tn.size > 0 && ![...tc].some((t) => tn.has(t));
+  const kCnn = phoneKey(cnnTel ?? "");
+  const kCts = (contatoTels ?? []).map((t) => phoneKey(t ?? "")).filter((k) => k.length >= 8);
+  if (kCnn.length >= 8 && kCts.length && !kCts.includes(kCnn))
+    return { ok: false, motivo: "telefone_divergente", alertaNome };
+  return { ok: true, motivo: "confere", alertaNome };
+}
+
 // ══ FILA: Consumidor F2 — move 1 lead pra etapa de confirmação (idempotente) ═══
 async function consumirItemF2(item: any, env: Env, target: CnnTarget, dryRun: boolean): Promise<{ r: string; leadId?: string; nome?: string }> {
   const payload = item.payload ? JSON.parse(item.payload) : {};
@@ -2469,6 +2550,54 @@ async function consumirItemF2(item: any, env: Env, target: CnnTarget, dryRun: bo
   // Horário real da agenda confirmada. Sem hora não dá pra gerar um lembrete correto → pula (fail-closed).
   const cnnTs = (ag.data && ag.horaInicio) ? brtToUnix(ag.data, ag.horaInicio.slice(0, 5)) : 0;
   if (!cnnTs) return { r: "pulado_sem_hora", leadId };
+  // GUARD DE CONTATO (13/07) — bug Katia: o card pode estar ligado ao contato de OUTRA PESSOA (herdado na
+  // adoção e nunca re-sincronizado). Entrar na etapa de Confirmação DISPARA o Salesbot → o WhatsApp iria
+  // pro número errado. Confere o contato do card contra o CNN ANTES de mover; divergiu → NÃO move, abre
+  // tarefa pra clínica e deixa o card em Consulta Agendada (confirmação manual), igual ao [Familia].
+  // FAIL-CLOSED na leitura do Kommo (lança → transitório → filaAdiar retenta): melhor atrasar a
+  // confirmação do que mandar a mensagem pra pessoa errada.
+  {
+    const cnnTel = String(ag.telefoneCelularPaciente ?? "");
+    let contatoNome = "", contatoTels: string[] = [], ctId: string | null = null;
+    try {
+      const leadObj: any = await kommoGet(`/leads/${leadId}?with=contacts`, env);
+      const cts = leadObj?._embedded?.contacts ?? [];
+      ctId = (cts.find((c: any) => c.is_main)?.id ?? cts[0]?.id) ?? null;
+      if (ctId) {
+        const ct: any = await kommoGet(`/contacts/${ctId}`, env);
+        contatoNome = String(ct?.name ?? "");
+        contatoTels = (ct?.custom_fields_values ?? [])
+          .filter((f: any) => f.field_code === "PHONE")
+          .flatMap((f: any) => (f.values ?? []).map((v: any) => String(v?.value ?? "")));
+      }
+    } catch (e) {
+      // FAIL-CLOSED, mas SEM engolir erro permanente: 404 (card apagado)/401/403 têm que continuar
+      // PERMANENTES → dead-letter → alerta. Envelopar tudo como [TRANSITORIO] adiaria pra sempre e
+      // mataria a régua EM SILÊNCIO (achado da revisão adversarial).
+      if (ehTransitorio(e)) throw e;
+      throw new Error(`guard-contato Kommo lead ${leadId}: ${String(e)}`);
+    }
+    // GATE = TELEFONE (0 subrequest: o telefone do CNN veio na agenda já relida). O nome do CNN NÃO é
+    // buscado no caminho feliz — `cnnPacienteNome` custa até 3 tentativas × retry e só serviria pro
+    // alerta de qualidade de dado (que o /debug-simular-vespera?nomes=1 já mostra, read-only).
+    const chk = decidirContatoConfere(cnnTel, "", contatoTels, contatoNome);
+    if (!chk.ok) {
+      if (!dryRun) {
+        // Só AQUI o nome importa — pra escrever uma tarefa que a clínica entenda.
+        const cnnNome = String((await cnnPacienteNome(String(item.paciente_id_cnn), env, target)) ?? "");
+        const mesmaPessoa = !decidirContatoConfere(cnnTel, cnnNome, contatoTels, contatoNome).alertaNome && !!cnnNome;
+        const diagnostico = mesmaPessoa
+          ? `Parece a MESMA pessoa com CADASTRO DESATUALIZADO (o número do card é diferente do que o CNN tem).`
+          : `O contato do card parece ser OUTRA PESSOA (caso "Katia": o WhatsApp iria pro contato errado).`;
+        await audit(env, { funcao: "F2", ambiente: target, entidade_id: leadId, acao: "pulado_contato_divergente",
+          detalhe: `${chk.motivo}${mesmaPessoa ? " (mesmo nome)" : " (nome tb diverge)"}: contato ${ctId ?? "?"} "${contatoNome}" ${contatoTels.join("/")} vs CNN "${cnnNome}" ${cnnTel}` });
+        await criarTarefaLead(leadId,
+          `CONFIRMAÇÃO AUTOMÁTICA BLOQUEADA — o TELEFONE do contato do card ("${contatoNome}", ${contatoTels.join("/") || "sem telefone"}) NÃO é o do paciente no CNN ("${cnnNome || "?"}", ${cnnTel}). ${diagnostico} Confira o contato do card e confirme à mão.`,
+          Math.floor(Date.now() / 1000) + 2 * 3600, env);
+      }
+      return { r: "pulado_contato_divergente", leadId, nome: chk.motivo };
+    }
+  }
   const dest = VESPERA_DESTINO[grupo];
   if (!dryRun) {
     // FIX do bug do lembrete defasado: grava AGENDAMENTO + ID Agenda CNN da agenda confirmada ANTES de
@@ -3686,6 +3815,38 @@ function runSelftestLogic(): SelftestResultado {
     { nome: "sem card algum → null", dg: undefined, og: undefined, da: undefined, esp: { lead: null, crossFunnel: false } },
   ];
   for (const c of casosCard) selftestAssert(acc, `resolverCardVespera:${c.nome}`, c.esp, resolverCardVespera(c.dg, c.og, c.da));
+
+  // ── decidirSupressao: guard de TERMINAL no CNN_CONFIRMAR (13/07) ──
+  // Confirmar agenda já finalizada/cancelada → CNN devolve 400 permanente → dead-letter. Suprime antes.
+  const casosSup: Array<{ nome: string; estado: any; esperado: { executa: boolean; motivo: string } }> = [
+    { nome: "agenda AGENDADA → confirma", estado: { last_cnn_status: "AGENDADO" }, esperado: { executa: true, motivo: "confirmar" } },
+    { nome: "sem estado (agenda nova) → confirma", estado: null, esperado: { executa: true, motivo: "confirmar" } },
+    { nome: "já CONFIRMADO_PACIENTE → suprime (anti-loop)", estado: { last_cnn_status: "CONFIRMADO_PACIENTE" }, esperado: { executa: false, motivo: "ja_confirmado" } },
+    { nome: "FINALIZADO → suprime (era dead-letter: Julia/Kitty)", estado: { last_cnn_status: "FINALIZADO" }, esperado: { executa: false, motivo: "agenda_terminal_finalizado" } },
+    { nome: "CANCELADO → suprime", estado: { last_cnn_status: "CANCELADO" }, esperado: { executa: false, motivo: "agenda_terminal_cancelado" } },
+    { nome: "FALTOU → suprime", estado: { last_cnn_status: "FALTOU" }, esperado: { executa: false, motivo: "agenda_terminal_faltou" } },
+    { nome: "CANCELADO_PACIENTE → suprime (4º terminal; 'cancelei e mudei de ideia' vira tarefa, não PUT)", estado: { last_cnn_status: "CANCELADO_PACIENTE" }, esperado: { executa: false, motivo: "agenda_terminal_cancelado_paciente" } },
+  ];
+  for (const c of casosSup) selftestAssert(acc, `decidirSupressao:${c.nome}`, c.esperado, decidirSupressao({ tipo: "CNN_CONFIRMAR" }, c.estado));
+
+  // ── decidirContatoConfere: guard do bug Katia (13/07) ──
+  // BLOQUEIA só por TELEFONE (é pra ele que o WhatsApp vai). Nome divergente = ALERTA, nunca bloqueio:
+  // medido na régua real de 14/07 → 3 de 40 pacientes têm nome divergente COM o telefone certo
+  // (Zuleika/Zuleica, "Théo x Alexei", "Marcelo") — bloquear ali quebraria confirmação legítima.
+  const casosCt: Array<{ nome: string; cnnTel: string; cnnNome: string; ctTels: string[]; ctNome: string; esp: { ok: boolean; motivo: string; alertaNome: boolean } }> = [
+    { nome: "confere (mesmo tel, mesmo nome)", cnnTel: "51996222003", cnnNome: "Katia Fraga Gonçalves", ctTels: ["51996222003"], ctNome: "Katia Fraga Gonçalves", esp: { ok: true, motivo: "confere", alertaNome: false } },
+    { nome: "formatos diferentes do MESMO número → confere (phoneKey)", cnnTel: "+55 (51) 99622-2003", cnnNome: "Katia Fraga Gonçalves", ctTels: ["5196222003"], ctNome: "Katia F. Gonçalves", esp: { ok: true, motivo: "confere", alertaNome: false } },
+    { nome: "KATIA card A: contato é o MARIDO (tel do marido) → BLOQUEIA", cnnTel: "51996222003", cnnNome: "Katia Fraga Gonçalves", ctTels: ["13991245192"], ctNome: "Ricardo Martins PIRES", esp: { ok: false, motivo: "telefone_divergente", alertaNome: true } },
+    { nome: "KATIA card B: nome CERTO dela mas telefone do marido → BLOQUEIA (nome não pegaria)", cnnTel: "51996222003", cnnNome: "Katia Fraga Gonçalves", ctTels: ["13991245192"], ctNome: "Katia Fraga Gonçalves", esp: { ok: false, motivo: "telefone_divergente", alertaNome: false } },
+    { nome: "contato com 2 telefones, um deles o certo → confere", cnnTel: "51996222003", cnnNome: "Katia Fraga Gonçalves", ctTels: ["13991245192", "51996222003"], ctNome: "Katia Fraga Gonçalves", esp: { ok: true, motivo: "confere", alertaNome: false } },
+    { nome: "contato SEM telefone → não bloqueia (salesbot não manda pra ninguém errado)", cnnTel: "51996222003", cnnNome: "Maria Silva", ctTels: [], ctNome: "Maria Silva", esp: { ok: true, motivo: "confere", alertaNome: false } },
+    { nome: "CNN sem telefone → não inventa divergência", cnnTel: "", cnnNome: "Maria Silva", ctTels: ["51996222003"], ctNome: "Maria Silva", esp: { ok: true, motivo: "confere", alertaNome: false } },
+    { nome: "REAL 14/07 Zuleica×Zuleika (grafia): tel certo → NÃO bloqueia, só alerta", cnnTel: "(51) 99358-5484", cnnNome: "Zuleica Z Pinto Ribeiro", ctTels: ["+555193585484"], ctNome: "Zuleika", esp: { ok: true, motivo: "confere", alertaNome: true } },
+    { nome: "REAL 14/07 Théo×Alexei (parente c/ o número do paciente): tel certo → NÃO bloqueia", cnnTel: "(51) 99247-8008", cnnNome: "Théo Jung Susin", ctTels: ["+555192478008"], ctNome: "Alexei", esp: { ok: true, motivo: "confere", alertaNome: true } },
+    { nome: "sufixo (duplicata) não conta como nome diferente", cnnTel: "51996222003", cnnNome: "Maria Silva", ctTels: ["51996222003"], ctNome: "Maria Silva (duplicata)", esp: { ok: true, motivo: "confere", alertaNome: false } },
+    { nome: "nome do CNN vazio (rate-limit) → sem alerta e sem bloqueio", cnnTel: "51996222003", cnnNome: "", ctTels: ["51996222003"], ctNome: "Qualquer Um", esp: { ok: true, motivo: "confere", alertaNome: false } },
+  ];
+  for (const c of casosCt) selftestAssert(acc, `decidirContatoConfere:${c.nome}`, c.esp, decidirContatoConfere(c.cnnTel, c.cnnNome, c.ctTels, c.ctNome));
 
   // ── Portão ETAPAS_ORC_PODE_AGIR: age (consulta já assentou) vs adia ──
   const age: Array<[string, number]> = [
@@ -5643,7 +5804,7 @@ async function handleSimularVespera(req: Request, env: Env): Promise<Response> {
   }
 
   // 2. Agrupa por paciente; elegíveis = não-interno, não-terminal, com grupo A/B
-  const porPac = new Map<string, Array<{ agendaId: string; grupo: "A" | "B"; ts: number; hora: string }>>();
+  const porPac = new Map<string, Array<{ agendaId: string; grupo: "A" | "B"; ts: number; hora: string; tel: string }>>();
   const out: any = { data, agendas_no_dia: todas.length, pulados_interno: 0, pulados_terminal: 0, pulados_tipo: 0 };
   for (const a of todas) {
     if (a.data !== data) continue;
@@ -5656,7 +5817,7 @@ async function handleSimularVespera(req: Request, env: Env): Promise<Response> {
     const hora = String(a.horaInicio ?? "").slice(0, 5);
     const ts = hora ? brtToUnix(a.data, hora) : 0;
     const arr = porPac.get(pid) ?? [];
-    arr.push({ agendaId: String(a.id), grupo, ts, hora });
+    arr.push({ agendaId: String(a.id), grupo, ts, hora, tel: String(a.telefoneCelularPaciente ?? "") });
     porPac.set(pid, arr);
   }
 
@@ -5692,23 +5853,38 @@ async function handleSimularVespera(req: Request, env: Env): Promise<Response> {
       let agKommo = 0, stage = 0, leadObj: any = null;
       try { leadObj = await kommoGet(`/leads/${leadId}?with=contacts`, env); agKommo = Number(getFieldValue(leadObj, fAg) ?? 0); stage = Number(leadObj.status_id) || 0; } catch { /* */ }
       rec.etapa_atual = STAGE_NOME[stage] ?? String(stage);
+      // GUARD DE CONTATO (13/07, bug Katia): o simulador tem que PREVER o que a régua fará → roda a MESMA
+      // decisão pura do consumirItemF2 (decidirContatoConfere). Telefone é o gate duro (é pra ele que o
+      // WhatsApp vai); nome é o secundário. Sempre confere (não depende do &nomes=1) — senão o pré-check
+      // mentiria sobre quem realmente dispara. cnnPacienteNome só é buscado com &nomes=1 (é caro/rate-limited);
+      // sem ele, vale só o gate de telefone — exatamente como o consumidor se comporta se o nome não vier.
+      let nomeContato = "", contatoTels: string[] = [], ctId: any = null, nomeCnn = "";
+      if (leadObj) {
+        const cts = leadObj._embedded?.contacts ?? [];
+        ctId = (cts.find((c: any) => c.is_main)?.id) ?? cts[0]?.id ?? null;
+        if (ctId) {
+          try {
+            const ct: any = await kommoGet(`/contacts/${ctId}`, env);
+            nomeContato = String(ct?.name ?? "");
+            contatoTels = (ct?.custom_fields_values ?? []).filter((f: any) => f.field_code === "PHONE")
+              .flatMap((f: any) => (f.values ?? []).map((v: any) => String(v?.value ?? "")));
+          } catch { /* */ }
+        }
+      }
+      if (checkNomes) nomeCnn = String((await cnnPacienteNome(pid, env, target)) ?? "");
+      const chk = decidirContatoConfere(venc.tel, nomeCnn, contatoTels, nomeContato);
+      rec.contato = ctId; rec.contato_nome = nomeContato; rec.contato_tel = contatoTels.join("/") || null; rec.tel_cnn = venc.tel || null;
+      rec.contato_ok = chk.ok;
+      if (!chk.ok) rec.contato_alerta = `TELEFONE divergente — contato ${ctId} "${nomeContato}" ${contatoTels.join("/") || "sem tel"} vs CNN "${nomeCnn || "(nome não consultado)"}" ${venc.tel} → a régua NÃO vai confirmar (tarefa manual)`;
       if (checkNomes && leadObj) {
         const nomeLead = String(leadObj.name ?? "");
-        const cts = leadObj._embedded?.contacts ?? [];
-        const ctId = (cts.find((c: any) => c.is_main)?.id) ?? cts[0]?.id ?? null;
-        let nomeContato = "";
-        if (ctId) { try { const ct: any = await kommoGet(`/contacts/${ctId}`, env); nomeContato = String(ct?.name ?? ""); } catch { /* */ } }
-        const nomeCnn = String((await cnnPacienteNome(pid, env, target)) ?? "");
         const fracoL = nomeFraco(nomeLead), fracoC = nomeFraco(nomeContato);
-        const toks = (s: string) => new Set(normNome(s.replace(/\(duplicata\)/ig, "")).split(/\s+/).filter((t) => t.length >= 3));
-        const tc = toks(nomeContato), tn = toks(nomeCnn);
-        // divergência REAL = nenhum nome em comum (pessoa diferente, tipo Katia). Primeiro-nome/abreviação NÃO conta.
-        const diverge = !!nomeCnn && !!nomeContato && tc.size > 0 && tn.size > 0 && ![...tc].some((t) => tn.has(t));
         rec.nome_lead = nomeLead; rec.nome_contato = nomeContato; rec.nome_cnn = nomeCnn;
-        rec.nome_ok = !fracoL && !fracoC && !diverge;
+        rec.nome_ok = !fracoL && !fracoC && !chk.alertaNome;
         if (fracoL) rec.nome_alerta = "nome do LEAD fraco/placeholder";
         else if (fracoC) rec.nome_alerta = "nome do CONTATO fraco/placeholder";
-        else if (diverge) rec.nome_alerta = `CONTATO diverge do CNN: contato="${nomeContato}" vs CNN="${nomeCnn}" (tipo Katia)`;
+        // Só ALERTA (não bloqueia): telefone confere → a mensagem vai pro número certo (parente/grafia).
+        else if (chk.alertaNome) rec.nome_alerta = `nome do CONTATO diverge do CNN: "${nomeContato}" vs "${nomeCnn}" — mas o TELEFONE confere, então a confirmação SEGUE (só qualidade de dado)`;
       }
       rec.agendamento_kommo = agKommo ? `${unixToDateBRT(agKommo).data} ${unixToDateBRT(agKommo).hora}` : null;
       rec.horario_cnn = venc.ts ? `${unixToDateBRT(venc.ts).data} ${unixToDateBRT(venc.ts).hora}` : `${data} ${venc.hora}`;
@@ -5717,6 +5893,11 @@ async function handleSimularVespera(req: Request, env: Env): Promise<Response> {
         rec.resultado = "NAO_MOVE_PASSOU"; rec.explicacao = `NÃO dispara — a agenda das ${venc.hora} já passou.`; naoDispara.push(rec);
       } else if (familia) {
         rec.resultado = "NAO_MOVE_FAMILIA"; rec.explicacao = `NÃO dispara — número COMPARTILHADO (família: ${Number(nPac?.n)} pacientes no mesmo card ${leadId}) → confirmação MANUAL pela clínica.`; naoDispara.push(rec);
+      } else if (!chk.ok) {
+        // Mesma precedência do consumirItemF2: [Familia] primeiro, depois o guard de contato (13/07).
+        rec.resultado = "NAO_MOVE_CONTATO_DIVERGENTE";
+        rec.explicacao = `NÃO dispara — o TELEFONE do contato do card não é o do paciente no CNN: o WhatsApp iria pra pessoa ERRADA (bug Katia). Confirmação MANUAL + tarefa no card.`;
+        naoDispara.push(rec);
       } else if (jaLembrado) {
         rec.resultado = "NAO_MOVE_JA_LEMBRADO"; rec.explicacao = `NÃO dispara — já foi lembrado nessa data (dedup 1/lead/dia).`; naoDispara.push(rec);
       } else if (!rec.horario_bate) {

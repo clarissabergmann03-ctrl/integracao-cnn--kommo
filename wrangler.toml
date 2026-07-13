@@ -7,14 +7,23 @@ binding = "DB"
 database_name = "kommo-cnn-db"
 database_id = "158f672c-1589-439d-b550-8917f424c3ab"
 
+# ⚠️⚠️ WORKER APOSENTADO NO CUTOVER DE 07/07/2026 — NÃO REDEPLOYAR ⚠️⚠️
+# O sistema vivo é a Vercel (app/ → kommo-cnn.vercel.app) + Supabase. Este worker está
+# INERTE por falta de gatilho: o cron foi removido na Cloudflare (schedules=[]) e o D1 não
+# recebe uma escrita desde 07/07 13:27 UTC.
+#
+# Um `wrangler deploy` a partir deste diretório RESSUSCITA um SEGUNDO sistema escrevendo
+# no Kommo e no CNN de PRODUÇÃO (escrita dupla). Por isso o bloco [triggers] foi REMOVIDO
+# (13/07) — o estado "morto" agora é reproduzível pelo código, não só pela config remota.
+# Se algum dia for preciso religar o CF (rollback de emergência), restaurar:
+#   [triggers]
+#   crons = ["* * * * *"]
+# e SÓ depois de pausar o pg_cron do Supabase (select cron.unschedule('kommo-cnn-tick')),
+# senão os dois sistemas drenam a mesma fila lógica ao mesmo tempo.
+
 [vars]
 KOMMO_SUBDOMAIN = "atendimentoclinicabergmanncombr"
 # Webhooks Kommo→CNN (2026-07). GO-LIVE 07/07: LIGADOS, escrita em PRODUÇÃO.
 CNN_WRITE_TARGET = "production"
 WH1_ENABLED = "1"
 WH2_ENABLED = "1"
-
-[triggers]
-# Dispatcher único: a cada minuto reseta orçamento, roda produtores no horário
-# (confirmação Seg–Sex 18h UTC / Sáb 14h UTC; sync a cada 10 min) e drena a fila.
-crons = ["* * * * *"]
