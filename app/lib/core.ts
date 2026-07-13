@@ -1082,6 +1082,13 @@ function cnnProcedimentoCaptura(env: Env, target: CnnTarget): number {
 // ⚠️ O ÚNICO guarda anti-loop é a convergência de (last_agendamento_ts ±60s, last_cnn_status).
 //    A coluna `origin` é SÓ observabilidade/proveniência — NÃO é consultada aqui nem no polling
 //    (produtorSync/consumirItemA3). NÃO afrouxar a tolerância de 60s achando que `origin` é backstop.
+// Estados do CNN em que NÃO faz sentido gravar CONFIRMADO_PACIENTE — a consulta já aconteceu (ou morreu).
+// ⚠️ Set PRÓPRIO, NÃO reusar/ampliar STATUS_TERMINAL: aquele também rege `nearestVigente`/`produtorVespera`,
+// e meter EM_ESPERA lá tiraria agenda VIVA da janela de sync. Aqui é só o guard do webhook-1.
+// EM_ESPERA (paciente na recepção) e EM_ANDAMENTO (em atendimento) = a consulta JÁ OCORREU → o CNN recusa o
+// PUT com 400 permanente → dead-letter. Medido no espelho (13/07): 187 EM_ESPERA + 87 EM_ANDAMENTO = 33%
+// das 827 linhas, e 100% delas no PASSADO (0 futuras) → suprimir aqui não bloqueia nenhuma confirmação viva.
+const CNN_NAO_CONFIRMAVEL = new Set(["CANCELADO", "CANCELADO_PACIENTE", "FINALIZADO", "FALTOU", "EM_ESPERA", "EM_ANDAMENTO"]);
 type IntencaoCnn = { tipo: "CNN_CONFIRMAR" | "CNN_AGENDAR"; ts?: number; temAgendaNoCard?: boolean };
 function decidirSupressao(
   intent: IntencaoCnn,
@@ -1091,13 +1098,13 @@ function decidirSupressao(
     a != null && b != null && Math.abs(Number(a) - Number(b)) <= 60;
   if (intent.tipo === "CNN_CONFIRMAR") {
     if (estado?.last_cnn_status === "CONFIRMADO_PACIENTE") return { executa: false, motivo: "ja_confirmado" };
-    // GUARD DE TERMINAL (13/07): agenda já FINALIZADA/CANCELADA/FALTOU não pode ser confirmada — o CNN
-    // devolve 400 "já foi alterado por outra pessoa" (PERMANENTE) → 4 tentativas → dead-letter. Era a
+    // GUARD DE "JÁ ACONTECEU" (13/07): agenda que já foi realizada/cancelada não pode ser confirmada — o
+    // CNN devolve 400 "já foi alterado por outra pessoa" (PERMANENTE) → 4 tentativas → dead-letter. Era a
     // causa dos 2 dead-letters vivos: as vítimas do bug do AGENDAMENTO defasado carregam no card o ID de
     // uma agenda ANTIGA (já realizada); ao reconfirmarem, o webhook mirava essa agenda morta. O estado
-    // local JÁ SABIA (agenda_sync.last_cnn_status=FINALIZADO) — só ninguém perguntava. Espelha o guard que
-    // o consumirItemF2 ganhou em 5a12152; o caminho do webhook-1 nunca tinha recebido. Custo: 0 subrequest.
-    if (estado?.last_cnn_status && STATUS_TERMINAL.has(estado.last_cnn_status))
+    // local JÁ SABIA (agenda_sync.last_cnn_status) — só ninguém perguntava. Espelha o guard que o
+    // consumirItemF2 ganhou em 5a12152; o caminho do webhook-1 nunca tinha recebido. Custo: 0 subrequest.
+    if (estado?.last_cnn_status && CNN_NAO_CONFIRMAVEL.has(estado.last_cnn_status))
       return { executa: false, motivo: `agenda_terminal_${estado.last_cnn_status.toLowerCase()}` };
     return { executa: true, motivo: "confirmar" };
   }
@@ -2550,6 +2557,18 @@ async function consumirItemF2(item: any, env: Env, target: CnnTarget, dryRun: bo
   // Horário real da agenda confirmada. Sem hora não dá pra gerar um lembrete correto → pula (fail-closed).
   const cnnTs = (ag.data && ag.horaInicio) ? brtToUnix(ag.data, ag.horaInicio.slice(0, 5)) : 0;
   if (!cnnTs) return { r: "pulado_sem_hora", leadId };
+  const fields = await resolveFields(env);
+  // ⚠️ O VÍNCULO É GRAVADO ANTES DO GUARD DE CONTATO (achado da revisão de integração). Escrever campo
+  // NÃO dispara o Salesbot — só a ENTRADA na etapa dispara (é a premissa do fix de 11/07). Se o guard
+  // abaixo bloquear, a tarefa manda a clínica confirmar À MÃO nesse card — e ele PRECISA carregar o ID
+  // da agenda CERTA, senão a confirmação manual (Salesbot → webhook 1) miraria a agenda ANTIGA do card
+  // e cairia exatamente no 400/dead-letter que o guard de terminal acabou de tapar. O seed do agenda_sync
+  // pela mesma razão: deixa o espelho fresco pra essa agenda, com o status VIVO do CNN.
+  if (!dryRun) {
+    await escreverVinculoCnn(leadId, String(item.agenda_id_cnn), String(item.paciente_id_cnn), cnnTs, fields, env);
+    await upsertAgendaSync({ agenda_id_cnn: String(item.agenda_id_cnn), lead_id_kommo: leadId, paciente_id_cnn: String(item.paciente_id_cnn), last_agendamento_ts: cnnTs, last_cnn_status: ag.status ?? "" }, env);
+    await audit(env, { funcao: "F2", ambiente: target, entidade_id: leadId, acao: "agendamento-fixado", para: `${unixToDateBRT(cnnTs).data} ${unixToDateBRT(cnnTs).hora}`, detalhe: `agenda ${item.agenda_id_cnn}` });
+  }
   // GUARD DE CONTATO (13/07) — bug Katia: o card pode estar ligado ao contato de OUTRA PESSOA (herdado na
   // adoção e nunca re-sincronizado). Entrar na etapa de Confirmação DISPARA o Salesbot → o WhatsApp iria
   // pro número errado. Confere o contato do card contra o CNN ANTES de mover; divergiu → NÃO move, abre
@@ -2598,20 +2617,10 @@ async function consumirItemF2(item: any, env: Env, target: CnnTarget, dryRun: bo
       return { r: "pulado_contato_divergente", leadId, nome: chk.motivo };
     }
   }
+  // O vínculo (AGENDAMENTO + ID Agenda CNN) + o seed do agenda_sync JÁ foram gravados acima, ANTES do
+  // guard de contato — o Salesbot só é disparado agora, pela ENTRADA na etapa, e já lê a data certa.
   const dest = VESPERA_DESTINO[grupo];
   if (!dryRun) {
-    // FIX do bug do lembrete defasado: grava AGENDAMENTO + ID Agenda CNN da agenda confirmada ANTES de
-    // mover o card. Assim o Salesbot (disparado pela ENTRada na etapa) sempre lê a data certa, sem depender
-    // do produtorSync ter sincronizado. Escrever aqui, na entrada, NÃO conflita com o "congela" (item 3),
-    // que só protege reescritas POSTERIORES com o card já na confirmação.
-    const fields = await resolveFields(env);
-    await escreverVinculoCnn(leadId, String(item.agenda_id_cnn), String(item.paciente_id_cnn), cnnTs, fields, env);
-    // Registra a agenda confirmada no agenda_sync (mesma semântica do baseline do A3). SEM isto, o
-    // produtorSync seguinte veria est===null p/ esta agenda → branch BASELINE do consumirItemA3, que
-    // reescreve o AGENDAMENTO IGNORANDO o "congela" (re-toca o campo já em confirmação; e num paciente
-    // com nearestVigente≠agenda confirmada poderia sobrescrever com outra agenda). Com o seed, A3 vê est≠null.
-    await upsertAgendaSync({ agenda_id_cnn: String(item.agenda_id_cnn), lead_id_kommo: leadId, paciente_id_cnn: String(item.paciente_id_cnn), last_agendamento_ts: cnnTs, last_cnn_status: ag.status ?? "" }, env);
-    await audit(env, { funcao: "F2", ambiente: target, entidade_id: leadId, acao: "agendamento-fixado", para: `${unixToDateBRT(cnnTs).data} ${unixToDateBRT(cnnTs).hora}`, detalhe: `agenda ${item.agenda_id_cnn}` });
     await moveLeadToStage(leadId, dest.etapa, env, dest.pipeline);
     await registrarLembrete({ chave: `${leadId}|${item.agenda_id_cnn}|${data}`, lead_id_kommo: leadId, agenda_id_cnn: String(item.agenda_id_cnn), data_agendamento: data, grupo, pipeline_destino: dest.pipeline, etapa_destino: dest.etapa }, env);
   }
@@ -3826,6 +3835,9 @@ function runSelftestLogic(): SelftestResultado {
     { nome: "CANCELADO → suprime", estado: { last_cnn_status: "CANCELADO" }, esperado: { executa: false, motivo: "agenda_terminal_cancelado" } },
     { nome: "FALTOU → suprime", estado: { last_cnn_status: "FALTOU" }, esperado: { executa: false, motivo: "agenda_terminal_faltou" } },
     { nome: "CANCELADO_PACIENTE → suprime (4º terminal; 'cancelei e mudei de ideia' vira tarefa, não PUT)", estado: { last_cnn_status: "CANCELADO_PACIENTE" }, esperado: { executa: false, motivo: "agenda_terminal_cancelado_paciente" } },
+    // EM_ESPERA/EM_ANDAMENTO = a consulta JÁ ACONTECEU (33% do espelho; 100% no passado) → o CNN recusa o PUT.
+    { nome: "EM_ESPERA (paciente na recepção) → suprime", estado: { last_cnn_status: "EM_ESPERA" }, esperado: { executa: false, motivo: "agenda_terminal_em_espera" } },
+    { nome: "EM_ANDAMENTO (em atendimento) → suprime", estado: { last_cnn_status: "EM_ANDAMENTO" }, esperado: { executa: false, motivo: "agenda_terminal_em_andamento" } },
   ];
   for (const c of casosSup) selftestAssert(acc, `decidirSupressao:${c.nome}`, c.esperado, decidirSupressao({ tipo: "CNN_CONFIRMAR" }, c.estado));
 
@@ -3845,6 +3857,12 @@ function runSelftestLogic(): SelftestResultado {
     { nome: "REAL 14/07 Théo×Alexei (parente c/ o número do paciente): tel certo → NÃO bloqueia", cnnTel: "(51) 99247-8008", cnnNome: "Théo Jung Susin", ctTels: ["+555192478008"], ctNome: "Alexei", esp: { ok: true, motivo: "confere", alertaNome: true } },
     { nome: "sufixo (duplicata) não conta como nome diferente", cnnTel: "51996222003", cnnNome: "Maria Silva", ctTels: ["51996222003"], ctNome: "Maria Silva (duplicata)", esp: { ok: true, motivo: "confere", alertaNome: false } },
     { nome: "nome do CNN vazio (rate-limit) → sem alerta e sem bloqueio", cnnTel: "51996222003", cnnNome: "", ctTels: ["51996222003"], ctNome: "Qualquer Um", esp: { ok: true, motivo: "confere", alertaNome: false } },
+    // FORMA EXATA DA CHAMADA EM PRODUÇÃO: o consumidor passa cnnNome="" (o nome só é buscado se bloquear).
+    { nome: "PROD: nome vazio + telefone divergente → BLOQUEIA (o gate é só telefone)", cnnTel: "51996222003", cnnNome: "", ctTels: ["13991245192"], ctNome: "Ricardo Martins PIRES", esp: { ok: false, motivo: "telefone_divergente", alertaNome: false } },
+    { nome: "PROD: nome vazio + telefone certo → passa", cnnTel: "51996222003", cnnNome: "", ctTels: ["+55 51 99622-2003"], ctNome: "Katia", esp: { ok: true, motivo: "confere", alertaNome: false } },
+    // "mesma pessoa, cadastro conflitante" (caso Israel 15/07) — BLOQUEIA hoje (fail-safe: tarefa, nunca
+    // mensagem pra número incerto). Se o dono decidir que isso deve CONFIRMAR, é aqui que a regra muda.
+    { nome: "ISRAEL: mesmo nome, telefones conflitantes (Kommo 41x CNN 51) → BLOQUEIA (fail-safe)", cnnTel: "(51) 9371-7080", cnnNome: "Israel Dutra Campos", ctTels: ["4199211279"], ctNome: "Israel Dutra Campos", esp: { ok: false, motivo: "telefone_divergente", alertaNome: false } },
   ];
   for (const c of casosCt) selftestAssert(acc, `decidirContatoConfere:${c.nome}`, c.esp, decidirContatoConfere(c.cnnTel, c.cnnNome, c.ctTels, c.ctNome));
 
@@ -5859,6 +5877,7 @@ async function handleSimularVespera(req: Request, env: Env): Promise<Response> {
       // mentiria sobre quem realmente dispara. cnnPacienteNome só é buscado com &nomes=1 (é caro/rate-limited);
       // sem ele, vale só o gate de telefone — exatamente como o consumidor se comporta se o nome não vier.
       let nomeContato = "", contatoTels: string[] = [], ctId: any = null, nomeCnn = "";
+      let erroLeitura = !leadObj;   // o pré-check NÃO pode herdar "não bloqueia" de uma leitura que falhou
       if (leadObj) {
         const cts = leadObj._embedded?.contacts ?? [];
         ctId = (cts.find((c: any) => c.is_main)?.id) ?? cts[0]?.id ?? null;
@@ -5868,7 +5887,7 @@ async function handleSimularVespera(req: Request, env: Env): Promise<Response> {
             nomeContato = String(ct?.name ?? "");
             contatoTels = (ct?.custom_fields_values ?? []).filter((f: any) => f.field_code === "PHONE")
               .flatMap((f: any) => (f.values ?? []).map((v: any) => String(v?.value ?? "")));
-          } catch { /* */ }
+          } catch { erroLeitura = true; }
         }
       }
       if (checkNomes) nomeCnn = String((await cnnPacienteNome(pid, env, target)) ?? "");
@@ -5889,7 +5908,13 @@ async function handleSimularVespera(req: Request, env: Env): Promise<Response> {
       rec.agendamento_kommo = agKommo ? `${unixToDateBRT(agKommo).data} ${unixToDateBRT(agKommo).hora}` : null;
       rec.horario_cnn = venc.ts ? `${unixToDateBRT(venc.ts).data} ${unixToDateBRT(venc.ts).hora}` : `${data} ${venc.hora}`;
       rec.horario_bate = agKommo ? (Math.abs(agKommo - venc.ts) <= 60) : false;
-      if (venc.ts && venc.ts < agora) {
+      if (erroLeitura) {
+        // Sem a leitura do Kommo o simulador NÃO sabe o que a régua fará (o consumidor é fail-closed e
+        // LANÇA nesse caso). Reportar "move" aqui faria o pré-check MENTIR (achado da revisão).
+        rec.resultado = "INDEFINIDO_ERRO_LEITURA"; rec.contato_ok = null;
+        rec.explicacao = `INDEFINIDO — falha ao ler o lead/contato no Kommo; a régua real é fail-closed (retenta/dead-letter). Rode de novo.`;
+        naoDispara.push(rec);
+      } else if (venc.ts && venc.ts < agora) {
         rec.resultado = "NAO_MOVE_PASSOU"; rec.explicacao = `NÃO dispara — a agenda das ${venc.hora} já passou.`; naoDispara.push(rec);
       } else if (familia) {
         rec.resultado = "NAO_MOVE_FAMILIA"; rec.explicacao = `NÃO dispara — número COMPARTILHADO (família: ${Number(nPac?.n)} pacientes no mesmo card ${leadId}) → confirmação MANUAL pela clínica.`; naoDispara.push(rec);
@@ -7106,7 +7131,11 @@ export async function handleScheduled(event: ScheduledEvent, env: Env, ctx: Exec
           gatilhos.push("orc");
         }
         // Dreno da fila todo minuto (escreve Kommo; nunca CNN)
-        cons = await consumirFila(env, target, false, 10, 40);
+        // Budget 40→60 (13/07): o guard de contato levou o item F2 de 3 p/ 5 subrequests, e no tick das
+        // 8h30 os produtores já gastam até ~21 → 5 F2 × 5 = 25 estouraria o 40 no meio do lote
+        // (`parou_orcamento`) e a régua atrasaria. O teto de 50 subreq/request era do Cloudflare; na
+        // Vercel não existe (maxDuration=300s, ticks medidos em 13–18s) → subir custa só wall-clock.
+        cons = await consumirFila(env, target, false, 10, 60);
       } catch (e) {
         tickOk = false;
         tickErro = String(e);
