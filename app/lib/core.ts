@@ -2216,6 +2216,19 @@ async function produtorSync(env: Env, target: CnnTarget, windowDays: number, soP
   return out;
 }
 
+// Item 3 (salesbot) × Item 4 (reagendamento) — dono 08/07. Quando a HORA da agenda muda no CNN
+// e o lead está (ou não) na etapa de confirmação dona do salesbot, decide o que fazer:
+//  • em confirmação + MESMO dia → "congela": NÃO toca AGENDAMENTO. Qualquer PATCH nesse campo
+//    desarma o passo "1h antes" do salesbot (que dispara pelo horário gravado). Deixa estável.
+//  • em confirmação + OUTRO dia → "sai_e_atualiza": reagendou de dia → tira da confirmação
+//    (nunca confirma data trocada) e grava o novo horário.
+//  • fora da confirmação        → "atualiza": grava o novo horário normalmente.
+type AcaoHoraConfirmacao = "congela" | "sai_e_atualiza" | "atualiza";
+function decidirHoraEmConfirmacao(emConfirmacao: boolean, mudouDeDia: boolean): AcaoHoraConfirmacao {
+  if (!emConfirmacao) return "atualiza";
+  return mudouDeDia ? "sai_e_atualiza" : "congela";
+}
+
 // ══ FILA: Consumidor A3 — ciclo de vida do card por (paciente, grupo) ══════════
 // Dois tipos de item:
 //  • kind:"orphan" → A sem agenda vigente: move o card A pra rota terminal (Perdido/
@@ -2316,12 +2329,18 @@ async function consumirItemA3(item: any, env: Env, target: CnnTarget, dryRun: bo
   const lastStatus = est.last_cnn_status ?? null;
   let movido = false; let etapaNome: string | undefined;
 
-  // Hora mudou (CNN prevalece) → atualiza Kommo (+ reset se estava em confirmação)
+  // Hora mudou (CNN prevalece) → atualiza Kommo. Item 3 (dono 08/07): se o lead está na etapa de
+  // confirmação (dona do salesbot) e a mudança é no MESMO dia, CONGELA o AGENDAMENTO (o salesbot
+  // dispara pelo horário estável; reescrever desarma o passo "1h antes"). Mudança de DIA estando em
+  // confirmação = reagendamento (item 4) → tira da confirmação e grava o novo horário.
   if (cnnTs && lastTs !== null && Math.abs(cnnTs - lastTs) > 60 && !dryRun) {
     let etapa = 0;
-    try { etapa = (await kommoGet(`/leads/${leadId}`, env)).status_id; } catch { /* ignore */ }
-    if (etapa === ETAPA_CONFIRMACAO[grupo]) await moveLeadToStage(leadId, ETAPA_BASE[grupo], env, pipelineDoGrupo(grupo));
-    await setAgendamento(leadId, cnnTs, fAgendamento, env);
+    try { etapa = Number((await kommoGet(`/leads/${leadId}`, env)).status_id) || 0; } catch { /* ignore */ }
+    const emConfirmacao = etapa === ETAPA_CONFIRMACAO[grupo];
+    const mudouDeDia = unixToDateBRT(cnnTs).data !== unixToDateBRT(lastTs).data;
+    const acao = decidirHoraEmConfirmacao(emConfirmacao, mudouDeDia);
+    if (acao === "sai_e_atualiza") await moveLeadToStage(leadId, ETAPA_BASE[grupo], env, pipelineDoGrupo(grupo));
+    if (acao !== "congela") await setAgendamento(leadId, cnnTs, fAgendamento, env);
   }
 
   // Status mudou → move etapa pelo grupo (só em transição). B: MAPA_STATUS sempre
@@ -2335,6 +2354,15 @@ async function consumirItemA3(item: any, env: Env, target: CnnTarget, dryRun: bo
 
   if (!dryRun) await upsertAgendaSync({ agenda_id_cnn: agendaId, lead_id_kommo: leadId, paciente_id_cnn: pid, last_agendamento_ts: cnnTs || lastTs, last_cnn_status: status }, env);
   return movido ? { r: "movido", leadId, nome: etapaNome } : { r: "sem_mudanca", leadId };
+}
+
+// Card a confirmar na véspera para o grupo vencedor (GRUPO-BASED, funil-correto — dono 09/07). Prefere o
+// card do (pid,grupo) via mapeamento; fallback = a linkagem da agenda, MAS nunca o card do OUTRO grupo
+// (guardrail anti-cross-funnel — bug Augusto 9950194: agenda A linkada ao card B movia o B cross-funnel).
+function resolverCardVespera(cardDoGrupo?: string, cardOutroGrupo?: string, cardDaAgenda?: string): { lead: string | null; crossFunnel: boolean } {
+  const crossFunnel = !!cardDaAgenda && cardDaAgenda === cardOutroGrupo; // agenda aponta pro card do outro funil
+  const lead = cardDoGrupo ?? (crossFunnel ? null : (cardDaAgenda ?? null));
+  return { lead, crossFunnel };
 }
 
 // ══ FILA: Produtor F2 (véspera) ═══════════════════════════════════════════════
@@ -2384,7 +2412,17 @@ async function produtorVespera(env: Env, target: CnnTarget, dataAlvo?: string, s
     // MAIS CEDO do dia: menor ts com hora (>0); agendas sem hora (ts=0) só se não houver com hora.
     const venc = ags.slice().sort((x, y) => (x.ts || Infinity) - (y.ts || Infinity))[0];
     const g = venc.grupo, agendaId = venc.agendaId;
-    const leadId = agSync.get(agendaId)?.lead ?? mapLead.get(mapeamentoKey(pid, g));
+    // GRUPO-BASED (dono 09/07, fix cross-funnel): o grupo da agenda mais cedo decide o card via
+    // mapeamento(pid,grupo) — funil-correto por construção (A→Captação, B→Pós-Venda). Antes usava
+    // agenda_sync[agenda] PRIMEIRO, que podia apontar pro card do OUTRO funil (agenda A colada no card B)
+    // → movia o card cross-funnel (bug Augusto 9950194). Fallback (sem card do grupo): a linkagem da
+    // agenda, MAS só se NÃO for o card do outro grupo (guardrail: nunca arrasta o card do outro funil).
+    const { lead: leadId, crossFunnel } = resolverCardVespera(
+      mapLead.get(mapeamentoKey(pid, g)),
+      mapLead.get(mapeamentoKey(pid, g === "A" ? "B" : "A")),
+      agSync.get(agendaId)?.lead,
+    );
+    if (crossFunnel) out.cross_funnel_evitado = (out.cross_funnel_evitado ?? 0) + 1;
     if (!leadId) { out.nao_mapeado++; continue; }
     if (await leadJaLembradoNaData(leadId, amanha, env)) { out.ja_lembrado++; continue; }
     aEnfileirar.push({
@@ -2418,14 +2456,33 @@ async function consumirItemF2(item: any, env: Env, target: CnnTarget, dryRun: bo
   // passada ou terminal (cancelada/faltou/finalizada). Re-checa no CONSUMO porque a agenda pode ter sido
   // cancelada/reagendada entre o enfileiramento da véspera e o consumo (ainda mais com o lote que atrasa).
   if (data < todayBRT()) return { r: "pulado_passado", leadId };
-  try {
-    const ra: any = await cnnGet(`/agenda/lista?codigoPaciente=${item.paciente_id_cnn}&dataInicial=${data}&dataFinal=${data}&registrosPorPagina=200&pagina=0`, env, target);
-    const ag = (ra?.lista ?? []).find((a: any) => String(a.id) === String(item.agenda_id_cnn));
-    if (!ag) return { r: "pulado_agenda_sumiu", leadId };            // reagendada/removida → não confirma
-    if (STATUS_TERMINAL.has(ag.status ?? "")) return { r: "pulado_terminal", leadId };
-  } catch { /* falha de leitura CNN: não bloqueia (o filtro da véspera já cobriu no enfileiramento) */ }
+  // FONTE DA VERDADE = a agenda EXATA que a régua vai confirmar, relida do CNN AGORA. FAIL-CLOSED: NÃO
+  // engole falha de leitura (o cnnGet lança → transitório → filaAdiar retenta). Confirmar sem a agenda real
+  // é o que gerava o bug (11/07): sem verificar o horário, o card ia pra Confirmação com o AGENDAMENTO de
+  // uma agenda ANTIGA (o produtorSync, janela larga −2/+14, às vezes não sincroniza a agenda futura) →
+  // Salesbot mandava a data velha (ex.: Carmen 29/06 no lugar de 13/07). Melhor NÃO confirmar do que
+  // confirmar com data não verificada.
+  const ra: any = await cnnGet(`/agenda/lista?codigoPaciente=${item.paciente_id_cnn}&dataInicial=${data}&dataFinal=${data}&registrosPorPagina=200&pagina=0`, env, target);
+  const ag = (ra?.lista ?? []).find((a: any) => String(a.id) === String(item.agenda_id_cnn));
+  if (!ag) return { r: "pulado_agenda_sumiu", leadId };            // reagendada/removida → não confirma
+  if (STATUS_TERMINAL.has(ag.status ?? "")) return { r: "pulado_terminal", leadId };
+  // Horário real da agenda confirmada. Sem hora não dá pra gerar um lembrete correto → pula (fail-closed).
+  const cnnTs = (ag.data && ag.horaInicio) ? brtToUnix(ag.data, ag.horaInicio.slice(0, 5)) : 0;
+  if (!cnnTs) return { r: "pulado_sem_hora", leadId };
   const dest = VESPERA_DESTINO[grupo];
   if (!dryRun) {
+    // FIX do bug do lembrete defasado: grava AGENDAMENTO + ID Agenda CNN da agenda confirmada ANTES de
+    // mover o card. Assim o Salesbot (disparado pela ENTRada na etapa) sempre lê a data certa, sem depender
+    // do produtorSync ter sincronizado. Escrever aqui, na entrada, NÃO conflita com o "congela" (item 3),
+    // que só protege reescritas POSTERIORES com o card já na confirmação.
+    const fields = await resolveFields(env);
+    await escreverVinculoCnn(leadId, String(item.agenda_id_cnn), String(item.paciente_id_cnn), cnnTs, fields, env);
+    // Registra a agenda confirmada no agenda_sync (mesma semântica do baseline do A3). SEM isto, o
+    // produtorSync seguinte veria est===null p/ esta agenda → branch BASELINE do consumirItemA3, que
+    // reescreve o AGENDAMENTO IGNORANDO o "congela" (re-toca o campo já em confirmação; e num paciente
+    // com nearestVigente≠agenda confirmada poderia sobrescrever com outra agenda). Com o seed, A3 vê est≠null.
+    await upsertAgendaSync({ agenda_id_cnn: String(item.agenda_id_cnn), lead_id_kommo: leadId, paciente_id_cnn: String(item.paciente_id_cnn), last_agendamento_ts: cnnTs, last_cnn_status: ag.status ?? "" }, env);
+    await audit(env, { funcao: "F2", ambiente: target, entidade_id: leadId, acao: "agendamento-fixado", para: `${unixToDateBRT(cnnTs).data} ${unixToDateBRT(cnnTs).hora}`, detalhe: `agenda ${item.agenda_id_cnn}` });
     await moveLeadToStage(leadId, dest.etapa, env, dest.pipeline);
     await registrarLembrete({ chave: `${leadId}|${item.agenda_id_cnn}|${data}`, lead_id_kommo: leadId, agenda_id_cnn: String(item.agenda_id_cnn), data_agendamento: data, grupo, pipeline_destino: dest.pipeline, etapa_destino: dest.etapa }, env);
   }
@@ -3541,7 +3598,7 @@ async function handleDebugOrcamentoImpacto(req: Request, env: Env): Promise<Resp
   }
   const todos = [...pids.entries()];
   const fatia = todos.slice(offset, offset + max);
-  const out: any = { total_pacientes_aprovado: todos.length, cutoff_aprovacao: cutoffAprov, offset, processados: 0, moveria_tratamento_iniciado: 0, criaria_card_b: 0, ja_no_alvo: 0, adiado_agenda_futura: 0, nao_recente: 0, adiado_etapa: 0, por_etapa_adiada: {} as Record<string, number>, amostra: [] as any[] };
+  const out: any = { total_pacientes_aprovado: todos.length, cutoff_aprovacao: cutoffAprov, offset, processados: 0, moveria_tratamento_iniciado: 0, criaria_card_b: 0, ja_no_alvo: 0, adiado_agenda_futura: 0, nao_recente: 0, adiado_etapa: 0, por_etapa_adiada: {} as Record<string, number>, amostra: [] as any[], amostra_ja_no_alvo: [] as any[], amostra_adiado_etapa: [] as any[] };
   for (const [pid, info] of fatia) {
     if (!orcamentoOk(48)) { out.parou_orcamento = true; break; }
     // Portões primeiro (D1, sem subreq): agenda futura manda; aprovação antiga não reativa.
@@ -3551,8 +3608,8 @@ async function handleDebugOrcamentoImpacto(req: Request, env: Env): Promise<Resp
     // Opção 2 (02/07): sem card B → o ORC CRIARIA o card cliente (não pula mais).
     if (!lead) { out.criaria_card_b++; if (out.amostra.length < 15) out.amostra.push({ pid, acao: "criaria_card_b", aprov: info.aprov }); out.processados++; continue; }
     let et = 0; try { et = Number((await kommoGet(`/leads/${lead}`, env)).status_id) || 0; } catch { /* */ }
-    if (!ETAPAS_ORC_PODE_AGIR.has(et)) { out.adiado_etapa++; const n = STAGE_NOME[et] ?? String(et); out.por_etapa_adiada[n] = (out.por_etapa_adiada[n] ?? 0) + 1; out.processados++; continue; }
-    if (et === STAGE_POS_TRATAMENTO_INICIADO) { out.ja_no_alvo++; out.processados++; continue; }
+    if (!ETAPAS_ORC_PODE_AGIR.has(et)) { out.adiado_etapa++; const n = STAGE_NOME[et] ?? String(et); out.por_etapa_adiada[n] = (out.por_etapa_adiada[n] ?? 0) + 1; if (out.amostra_adiado_etapa.length < 10) out.amostra_adiado_etapa.push({ pid, lead, etapa: n, aprov: info.aprov }); out.processados++; continue; }
+    if (et === STAGE_POS_TRATAMENTO_INICIADO) { out.ja_no_alvo++; if (out.amostra_ja_no_alvo.length < 10) out.amostra_ja_no_alvo.push({ pid, lead, aprov: info.aprov }); out.processados++; continue; }
     out.moveria_tratamento_iniciado++;
     if (out.amostra.length < 15) out.amostra.push({ pid, lead, de: STAGE_NOME[et] ?? et, aprov: info.aprov });
     out.processados++;
@@ -3607,6 +3664,28 @@ function runSelftestLogic(): SelftestResultado {
       orcamentos: [{ id: 1, status: "CANCELADO" }, { id: 2, status: "APROVADO" }], temFutura: true, esperado: null },
   ];
   for (const c of casos) selftestAssert(acc, `decidirEtapaOrcamento:${c.nome}`, c.esperado, decidirEtapaOrcamento(c.orcamentos, c.temFutura));
+
+  // ── Item 3 (salesbot) × Item 4 (reagendamento): decidirHoraEmConfirmacao ──
+  // Congela AGENDAMENTO enquanto em confirmação no MESMO dia (salesbot dispara);
+  // mudança de dia em confirmação = reagendamento → sai da confirmação; fora dela, atualiza.
+  const casosHora: Array<{ nome: string; emConf: boolean; mudouDia: boolean; esperado: AcaoHoraConfirmacao }> = [
+    { nome: "em confirmação + mesmo dia → congela (salesbot)", emConf: true, mudouDia: false, esperado: "congela" },
+    { nome: "em confirmação + outro dia → sai_e_atualiza (reagendou)", emConf: true, mudouDia: true, esperado: "sai_e_atualiza" },
+    { nome: "fora da confirmação + mesmo dia → atualiza", emConf: false, mudouDia: false, esperado: "atualiza" },
+    { nome: "fora da confirmação + outro dia → atualiza", emConf: false, mudouDia: true, esperado: "atualiza" },
+  ];
+  for (const c of casosHora) selftestAssert(acc, `decidirHoraEmConfirmacao:${c.nome}`, c.esperado, decidirHoraEmConfirmacao(c.emConf, c.mudouDia));
+
+  // ── resolverCardVespera (grupo-based + anti-cross-funnel, dono 09/07) ──
+  // (cardDoGrupo, cardOutroGrupo, cardDaAgenda) → { lead, crossFunnel }
+  const casosCard: Array<{ nome: string; dg?: string; og?: string; da?: string; esp: { lead: string | null; crossFunnel: boolean } }> = [
+    { nome: "tem card do grupo → usa ele", dg: "A1", og: "B1", da: "A1", esp: { lead: "A1", crossFunnel: false } },
+    { nome: "agenda linkada ao card do OUTRO grupo, mas tem card do grupo → usa o do grupo, flag cross", dg: "A1", og: "B1", da: "B1", esp: { lead: "A1", crossFunnel: true } }, // caso Augusto
+    { nome: "sem card do grupo + agenda aponta pro outro grupo → BLOQUEIA (lead null), flag cross", dg: undefined, og: "B1", da: "B1", esp: { lead: null, crossFunnel: true } },
+    { nome: "sem card do grupo + agenda aponta pra card neutro → usa a agenda", dg: undefined, og: "B1", da: "X9", esp: { lead: "X9", crossFunnel: false } },
+    { nome: "sem card algum → null", dg: undefined, og: undefined, da: undefined, esp: { lead: null, crossFunnel: false } },
+  ];
+  for (const c of casosCard) selftestAssert(acc, `resolverCardVespera:${c.nome}`, c.esp, resolverCardVespera(c.dg, c.og, c.da));
 
   // ── Portão ETAPAS_ORC_PODE_AGIR: age (consulta já assentou) vs adia ──
   const age: Array<[string, number]> = [
@@ -5537,6 +5616,133 @@ async function handleDebugCheckConfirmacao(req: Request, env: Env): Promise<Resp
   return Response.json(out);
 }
 
+// ══ /debug-simular-vespera — PRÉ-CHECK read-only da régua das 8:30 (NÃO move, NÃO enfileira). Para um
+// dia-alvo (default amanhã), simula EXATAMENTE a seleção do produtorVespera (mais cedo do dia por
+// paciente, 1 card do grupo vencedor) + os checks do consumirItemF2, e cruza CNN×Kommo. Responde: quem
+// VAI_CONFIRMAR / não-move (SEM_CARD, [Familia], passou, já-lembrado), se o AGENDAMENTO no Kommo BATE com
+// o horário do CNN, e se todo paciente agendado tem card. Zero escrita.
+async function handleSimularVespera(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const data = url.searchParams.get("data") ?? tomorrowBRT();
+  const target: CnnTarget = "production";
+  const tiposMap = await resolveTiposConsulta(env, target);
+  const fields = await resolveFields(env);
+  const fAg = fields["AGENDAMENTO"];
+  const agora = Math.floor(Date.now() / 1000);
+  const checkNomes = url.searchParams.get("nomes") === "1"; // ?nomes=1 → confere nome do lead+contato vs CNN (mais lento)
+
+  // 1. Coleta as agendas do dia (idêntico ao produtorVespera)
+  const todas: any[] = [];
+  let pag = 0, totalPag = 1;
+  while (pag < totalPag) {
+    let r: any;
+    try { r = await cnnGet(`/agenda/lista?dataInicial=${data}&dataFinal=${data}&registrosPorPagina=200&pagina=${pag}`, env, target); }
+    catch { break; }
+    totalPag = Math.max(r?.totalPaginas ?? 1, 1); pag++;
+    for (const a of (r?.lista ?? [])) todas.push(a);
+  }
+
+  // 2. Agrupa por paciente; elegíveis = não-interno, não-terminal, com grupo A/B
+  const porPac = new Map<string, Array<{ agendaId: string; grupo: "A" | "B"; ts: number; hora: string }>>();
+  const out: any = { data, agendas_no_dia: todas.length, pulados_interno: 0, pulados_terminal: 0, pulados_tipo: 0 };
+  for (const a of todas) {
+    if (a.data !== data) continue;
+    if (isTarefaInterna(a)) { out.pulados_interno++; continue; }
+    if (STATUS_TERMINAL.has(a.status ?? "")) { out.pulados_terminal++; continue; }
+    const grupo = grupoDaAgenda(a, tiposMap);
+    if (!grupo) { out.pulados_tipo++; continue; }
+    const pid = String(a.idPaciente ?? "");
+    if (!pid) continue;
+    const hora = String(a.horaInicio ?? "").slice(0, 5);
+    const ts = hora ? brtToUnix(a.data, hora) : 0;
+    const arr = porPac.get(pid) ?? [];
+    arr.push({ agendaId: String(a.id), grupo, ts, hora });
+    porPac.set(pid, arr);
+  }
+
+  const agSync = await getAgendaSyncMap(env);
+  const mapLead = await getMapeamentoLeadMap(env);
+  const grupoA: any[] = []; // cards DUPLICATA (F.Captura) que vão confirmar
+  const grupoB: any[] = []; // cards ORIGINAL (Pós-Venda) que vão confirmar
+  const naoDispara: any[] = [];
+  const resumo: Record<string, number> = {};
+  for (const [pid, ags] of porPac) {
+    const venc = ags.slice().sort((x, y) => (x.ts || Infinity) - (y.ts || Infinity))[0]; // MAIS CEDO do dia
+    const temA = ags.some((a) => a.grupo === "A"), temB = ags.some((a) => a.grupo === "B");
+    // GRUPO-BASED + guardrail (mesma função do produtorVespera): card do grupo vencedor via mapeamento.
+    const cardDaAgenda = agSync.get(venc.agendaId)?.lead;
+    const { lead: leadId, crossFunnel } = resolverCardVespera(
+      mapLead.get(mapeamentoKey(pid, venc.grupo)),
+      mapLead.get(mapeamentoKey(pid, venc.grupo === "A" ? "B" : "A")),
+      cardDaAgenda,
+    );
+    const tipoCard = venc.grupo === "A" ? "DUPLICATA (A/F.Captura)" : "ORIGINAL (B/Pós-Venda)";
+    const outroCard = venc.grupo === "A" ? "ORIGINAL (B)" : "DUPLICATA (A)";
+    const nota2ag = (temA && temB) ? ` — tem consulta(A) E procedimento(B) hoje; a mais cedo é ${venc.grupo}(${venc.hora}), então dispara no ${tipoCard} e o card ${outroCard} fica quieto` : "";
+    const rec: any = { pid, agendas_dia: ags.map((a) => `${a.hora || "s/h"}${a.grupo}`).join(" "), confirma_hora: venc.hora, grupo: venc.grupo, card: leadId, tipo_card: tipoCard };
+    if (crossFunnel) rec.cross_funnel_evitado = `a agenda ${venc.grupo} estava linkada ao card do OUTRO funil (${cardDaAgenda}); guardrail usou o card do grupo (${leadId ?? "nenhum"})`;
+    if (!leadId) {
+      rec.resultado = "SEM_CARD";
+      rec.explicacao = `NÃO dispara — paciente agendado (grupo ${venc.grupo}) mas SEM card no Kommo${crossFunnel ? " (a agenda apontava pro card do outro funil — cross-funnel BLOQUEADO)" : ""}.`;
+      naoDispara.push(rec);
+    } else {
+      const nPac = await env.DB.prepare(`SELECT COUNT(DISTINCT paciente_id_cnn) n FROM mapeamento WHERE lead_id_kommo=?`).bind(leadId).first<any>();
+      const familia = Number(nPac?.n ?? 0) >= 2;
+      const jaLembrado = await leadJaLembradoNaData(leadId, data, env);
+      let agKommo = 0, stage = 0, leadObj: any = null;
+      try { leadObj = await kommoGet(`/leads/${leadId}?with=contacts`, env); agKommo = Number(getFieldValue(leadObj, fAg) ?? 0); stage = Number(leadObj.status_id) || 0; } catch { /* */ }
+      rec.etapa_atual = STAGE_NOME[stage] ?? String(stage);
+      if (checkNomes && leadObj) {
+        const nomeLead = String(leadObj.name ?? "");
+        const cts = leadObj._embedded?.contacts ?? [];
+        const ctId = (cts.find((c: any) => c.is_main)?.id) ?? cts[0]?.id ?? null;
+        let nomeContato = "";
+        if (ctId) { try { const ct: any = await kommoGet(`/contacts/${ctId}`, env); nomeContato = String(ct?.name ?? ""); } catch { /* */ } }
+        const nomeCnn = String((await cnnPacienteNome(pid, env, target)) ?? "");
+        const fracoL = nomeFraco(nomeLead), fracoC = nomeFraco(nomeContato);
+        const toks = (s: string) => new Set(normNome(s.replace(/\(duplicata\)/ig, "")).split(/\s+/).filter((t) => t.length >= 3));
+        const tc = toks(nomeContato), tn = toks(nomeCnn);
+        // divergência REAL = nenhum nome em comum (pessoa diferente, tipo Katia). Primeiro-nome/abreviação NÃO conta.
+        const diverge = !!nomeCnn && !!nomeContato && tc.size > 0 && tn.size > 0 && ![...tc].some((t) => tn.has(t));
+        rec.nome_lead = nomeLead; rec.nome_contato = nomeContato; rec.nome_cnn = nomeCnn;
+        rec.nome_ok = !fracoL && !fracoC && !diverge;
+        if (fracoL) rec.nome_alerta = "nome do LEAD fraco/placeholder";
+        else if (fracoC) rec.nome_alerta = "nome do CONTATO fraco/placeholder";
+        else if (diverge) rec.nome_alerta = `CONTATO diverge do CNN: contato="${nomeContato}" vs CNN="${nomeCnn}" (tipo Katia)`;
+      }
+      rec.agendamento_kommo = agKommo ? `${unixToDateBRT(agKommo).data} ${unixToDateBRT(agKommo).hora}` : null;
+      rec.horario_cnn = venc.ts ? `${unixToDateBRT(venc.ts).data} ${unixToDateBRT(venc.ts).hora}` : `${data} ${venc.hora}`;
+      rec.horario_bate = agKommo ? (Math.abs(agKommo - venc.ts) <= 60) : false;
+      if (venc.ts && venc.ts < agora) {
+        rec.resultado = "NAO_MOVE_PASSOU"; rec.explicacao = `NÃO dispara — a agenda das ${venc.hora} já passou.`; naoDispara.push(rec);
+      } else if (familia) {
+        rec.resultado = "NAO_MOVE_FAMILIA"; rec.explicacao = `NÃO dispara — número COMPARTILHADO (família: ${Number(nPac?.n)} pacientes no mesmo card ${leadId}) → confirmação MANUAL pela clínica.`; naoDispara.push(rec);
+      } else if (jaLembrado) {
+        rec.resultado = "NAO_MOVE_JA_LEMBRADO"; rec.explicacao = `NÃO dispara — já foi lembrado nessa data (dedup 1/lead/dia).`; naoDispara.push(rec);
+      } else if (!rec.horario_bate) {
+        rec.resultado = "CONFIRMA_MAS_HORARIO_DIVERGE"; rec.explicacao = `Dispara no card ${tipoCard} às ${venc.hora}, ⚠️ MAS o AGENDAMENTO no Kommo (${rec.agendamento_kommo}) NÃO bate com o CNN (${rec.horario_cnn}) — revisar${nota2ag}.`;
+        (venc.grupo === "A" ? grupoA : grupoB).push(rec);
+      } else {
+        rec.resultado = "VAI_CONFIRMAR"; rec.explicacao = `Dispara no card ${tipoCard} às ${venc.hora}${nota2ag}.`;
+        (venc.grupo === "A" ? grupoA : grupoB).push(rec);
+      }
+    }
+    resumo[rec.resultado] = (resumo[rec.resultado] ?? 0) + 1;
+  }
+  out.total_pacientes = porPac.size;
+  out.resumo = resumo;
+  out.GRUPO_A_dispara = { total: grupoA.length, nota: "cards DUPLICATA em F.Captura → Confirmação de Consulta", leads: grupoA };
+  out.GRUPO_B_dispara = { total: grupoB.length, nota: "cards ORIGINAL em Pós-Venda → Confirmação de Agendamento", leads: grupoB };
+  out.NAO_dispara = { total: naoDispara.length, leads: naoDispara };
+  const cross = [...grupoA, ...grupoB, ...naoDispara].filter((r) => r.cross_funnel_evitado);
+  out.CROSS_FUNNEL = { total: cross.length, nota: "agenda linkada ao card do outro funil — guardrail evitou o cross-funnel", leads: cross.map((r) => ({ pid: r.pid, card: r.card, grupo: r.grupo, detalhe: r.cross_funnel_evitado })) };
+  if (checkNomes) {
+    const suspeitos = [...grupoA, ...grupoB].filter((r) => r.nome_ok === false); // só os que VÃO disparar amanhã
+    out.NOMES_suspeitos = { total: suspeitos.length, leads: suspeitos.map((r) => ({ pid: r.pid, card: r.card, nome_lead: r.nome_lead, nome_contato: r.nome_contato, nome_cnn: r.nome_cnn, alerta: r.nome_alerta })) };
+  }
+  return Response.json(out);
+}
+
 // ══ /debug-listar-etapa — lista os leads numa etapa (pipeline+status), com AGENDAMENTO/ID Agenda e flag
 // se a agenda é PASSADA. READ-ONLY. Serve p/ auditar a "Confirmação de Consulta" (achar presos/errados).
 async function handleDebugListarEtapa(req: Request, env: Env): Promise<Response> {
@@ -6258,6 +6464,12 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
       if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
       resetSubreq();
       return handleDebugCheckConfirmacao(req, env);
+    }
+
+    if (pathname === "/debug-simular-vespera") { // PRÉ-CHECK read-only da régua 8:30 pra ?data= (default amanhã): quem confirma/não-move, horário Kommo×CNN, sem-card. NÃO move nada.
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      resetSubreq();
+      return handleSimularVespera(req, env);
     }
 
     if (pathname === "/debug-backfill-preview") {
