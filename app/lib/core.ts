@@ -6479,6 +6479,200 @@ async function migCriarCampos(env: Env): Promise<any> {
   };
 }
 
+// ══ /base-refresh — staging da base CNN → Supabase p/ o widget/dashboard ══════
+// SÓ LEITURA no CNN (cnnGet; JAMAIS cnnPost/Put/Delete). Escreve APENAS nas tabelas
+// base_pacientes e base_refresh_estado (exclusivas do widget) — NÃO toca
+// fila_trabalho/lease/tick/webhooks. Reusa a régua da migração (migAgendasPaciente,
+// migOrcamentosPaciente, derivarSinaisMig + grupoDaAgenda/tiposMap) p/ derivar os
+// sinais por paciente. Driver externo (widget) chama ?modo=step em loop.
+// Fases: parado → enumerar (stubs de /paciente/lista) → enriquecer → pronto | erro.
+// Auth: header Authorization === WEBHOOK_SECRET (discoverAuthOk, igual /debug-*).
+async function baseRefreshEnsureEstado(env: Env): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO base_refresh_estado (id, fase, pagina, total_paginas, total_pacientes, enriquecidos) VALUES (1,'parado',0,0,0,0) ON CONFLICT (id) DO NOTHING`
+  ).run();
+}
+// Snapshot do estado (shape que o widget consome). pendentes = COUNT enriquecido=false.
+async function baseRefreshStatus(env: Env): Promise<any> {
+  const est: any = await env.DB.prepare(`SELECT fase, pagina, total_paginas, total_pacientes, enriquecidos, detalhe FROM base_refresh_estado WHERE id=1`).first();
+  const pend: any = await env.DB.prepare(`SELECT COUNT(*) AS n FROM base_pacientes WHERE enriquecido=false`).first();
+  return {
+    ok: true,
+    fase: String(est?.fase ?? "parado"),
+    pagina: Number(est?.pagina ?? 0),
+    total_paginas: Number(est?.total_paginas ?? 0),
+    total_pacientes: Number(est?.total_pacientes ?? 0),
+    enriquecidos: Number(est?.enriquecidos ?? 0),
+    pendentes: Number(pend?.n ?? 0),
+    detalhe: est?.detalhe ?? null,
+  };
+}
+async function handleBaseRefresh(req: Request, env: Env): Promise<Response> {
+  const url = new URL(req.url);
+  const modo = url.searchParams.get("modo") ?? "status";
+  await baseRefreshEnsureEstado(env);
+
+  if (modo === "status") return Response.json(await baseRefreshStatus(env));
+
+  if (modo === "start") {
+    if (url.searchParams.get("zerar") === "1") await env.DB.prepare(`DELETE FROM base_pacientes`).run(); // SÓ esta tabela
+    await env.DB.prepare(
+      `UPDATE base_refresh_estado SET fase='enumerar', pagina=0, total_paginas=0, enriquecidos=0, total_pacientes=(SELECT COUNT(*) FROM base_pacientes), iniciado_em=now(), atualizado_em=now(), detalhe=NULL WHERE id=1`
+    ).run();
+    return Response.json(await baseRefreshStatus(env));
+  }
+
+  if (modo !== "step") return Response.json({ ok: false, error: "modo invalido (status|start|step)" }, { status: 400 });
+
+  const loteRaw = Number(url.searchParams.get("lote") ?? "15");
+  const lote = Math.min(Math.max(Number.isFinite(loteRaw) ? Math.floor(loteRaw) : 15, 1), 40);
+  let feitos = 0, erros = 0;
+  try {
+    const est: any = await env.DB.prepare(`SELECT fase, pagina, total_paginas FROM base_refresh_estado WHERE id=1`).first();
+    const fase = String(est?.fase ?? "parado");
+
+    if (fase === "enumerar") {
+      // Enumeração paginada de /paciente/lista em PRODUÇÃO (mesmo padrão do mig-import:
+      // registrosPorPagina+pagina, resposta {lista, totalPaginas}). Até 3 páginas por step.
+      let pagina = Number(est?.pagina ?? 0);
+      let totalPaginas = Number(est?.total_paginas ?? 0);
+      for (let i = 0; i < 3; i++) {
+        if (totalPaginas > 0 && pagina >= totalPaginas) break;
+        resetSubreq(); // orçamento de retry por página (padrão dos handlers /debug-*; rota é read-only no CNN)
+        const r: any = await cnnGet(`/paciente/lista?registrosPorPagina=100&pagina=${pagina}`, env, "production", retrySweep());
+        const lista: any[] = r?.lista ?? [];
+        if (!lista.length) { totalPaginas = pagina; break; } // página vazia → enumeração acabou
+        totalPaginas = Math.max(Number(r?.totalPaginas ?? 0), pagina + 1);
+        const stmts: any[] = [];
+        for (const p of lista) {
+          const pid = String(p.id ?? p.idPaciente ?? "");
+          if (!pid) continue;
+          const nasc = String(p.dataNascimento ?? "").slice(0, 10) || null;
+          // UPSERT de stub: SÓ campos cadastrais no DO UPDATE (preserva enriquecido e as colunas derivadas).
+          stmts.push(env.DB.prepare(
+            `INSERT INTO base_pacientes (paciente_id_cnn, nome, telefone, email, nascimento, ativo, enriquecido)
+             VALUES (?,?,?,?,?,?,false)
+             ON CONFLICT (paciente_id_cnn) DO UPDATE SET nome=EXCLUDED.nome, telefone=EXCLUDED.telefone, email=EXCLUDED.email, nascimento=EXCLUDED.nascimento, ativo=EXCLUDED.ativo`
+          ).bind(pid, p.nome ?? null, p.telefoneCelular ?? p.contato?.telefoneCelular ?? p.telefone ?? null, p.email ?? null, nasc, p.ativo == null ? null : !!p.ativo));
+          feitos++;
+        }
+        if (stmts.length) await env.DB.batch(stmts);
+        pagina++;
+      }
+      const fim = pagina >= totalPaginas; // cobre base vazia (totalPaginas=0) e última página
+      await env.DB.prepare(
+        `UPDATE base_refresh_estado SET fase=?, pagina=?, total_paginas=?, total_pacientes=(SELECT COUNT(*) FROM base_pacientes), atualizado_em=now() WHERE id=1`
+      ).bind(fim ? "enriquecer" : "enumerar", pagina, totalPaginas).run();
+    } else if (fase === "enriquecer") {
+      const tiposMap = await resolveTiposConsulta(env, "production");
+      const hoje = todayBRT();
+      const rows = ((await env.DB.prepare(`SELECT paciente_id_cnn FROM base_pacientes WHERE enriquecido=false ORDER BY paciente_id_cnn LIMIT ?`).bind(lote).all()).results as any[]) ?? [];
+      for (const row of rows) { // SEQUENCIAL de propósito (sem paralelo — gentil com o CNN)
+        const pid = String(row.paciente_id_cnn);
+        resetSubreq(); // orçamento de leitura CHEIO por paciente — senão migAgendasPaciente truncaria em silêncio (gate orcamentoOk(48))
+        try {
+          const agendas = await migAgendasPaciente(pid, env, "production");
+          const orcs = await migOrcamentosPaciente(pid, env, "production");
+          const { sinais, detalhe } = derivarSinaisMig(agendas, orcs, tiposMap);
+          const ags = agendas.map((a: any) => ({
+            data: String(a.data ?? "").slice(0, 10),
+            status: String(a.status ?? ""),
+            grupo: grupoDaAgenda(a, tiposMap),
+            procs: ((a.procedimentos ?? []) as any[]),
+          }));
+          const datas = ags.map((a) => a.data).filter(Boolean).sort();
+          // "passado" REAL (data ≤ hoje) — coerente com o diasSilencio dos sinais: agenda futura não é atividade.
+          const agsPass = ags.filter((a) => a.data && a.data <= hoje).sort((a, b) => (a.data < b.data ? -1 : a.data > b.data ? 1 : 0));
+          const aprovacoes = orcs.map((o: any) => (o.dataAprovacao ? String(o.dataAprovacao).slice(0, 10) : null)).filter(Boolean) as string[];
+          const atividades = [...agsPass.map((a) => a.data), ...aprovacoes].sort();
+          // Orçamento com a aprovação MAIS RECENTE (mesmo desempate do derivarSinaisMig).
+          const aprovados = orcs.filter((o: any) => o.dataAprovacao).slice()
+            .sort((a: any, b: any) => (String(a.dataAprovacao) < String(b.dataAprovacao) ? -1 : String(a.dataAprovacao) > String(b.dataAprovacao) ? 1 : 0));
+          const feitosMap = new Map<string, number>(((detalhe?.feitos ?? []) as [string, number][]));
+          const temOrcadoNaoFeito = ((detalhe?.requeridos ?? []) as [string, number][]).some(([t, q]) => (feitosMap.get(t) ?? 0) < q);
+          // "Futura" REAL (data > hoje, status vivo) — NÃO usar sinais.temAgendaFutura aqui: o
+          // derivarSinaisMig ancora "futuro" em MIG_FUTURO_INI (2026-07-01, fixo p/ a migração
+          // one-time), o que tornaria "futura" toda agenda desde essa data para sempre e cegaria
+          // os filtros de repescagem (que excluem quem tem agenda futura). Achado ALTO da revisão.
+          const TERMINAIS_BASE = new Set(["FINALIZADO", "CANCELADO", "CANCELADO_PACIENTE", "FALTOU"]);
+          const agsFut = ags.filter((a) => a.data && a.data > hoje && !TERMINAIS_BASE.has(a.status));
+          const temFuturaReal = agsFut.length > 0;
+          const grupoFuturoReal = agsFut.some((a) => a.grupo === "B") ? "B" : (agsFut.some((a) => a.grupo === "A") ? "A" : null);
+          const ult3 = agsPass.slice(-3);
+          const caudaFaltasReal = !temFuturaReal && ult3.length > 0 &&
+            ult3.every((a) => a.status === "FALTOU" || a.status === "CANCELADO_PACIENTE" || a.status === "CANCELADO");
+          const procedimentosFeitos = ags.filter((a) => a.status === "FINALIZADO")
+            .flatMap((a) => a.procs.map((p: any) => ({ tipo: p?.idTipoProcedimento ?? null, nome: p?.nomeProcedimento ?? p?.nome ?? null, data: a.data || null })));
+          const procedimentosOrcados = orcs.flatMap((o: any) => ((o.procedimentos ?? []) as any[])
+            .map((p: any) => ({ tipo: p?.idTipoProcedimento ?? null, nome: p?.nomeProcedimento ?? p?.nome ?? null, qtd: Number(p?.quantidade ?? 1), orc_status: o.status ?? null })));
+          await env.DB.prepare(
+            `UPDATE base_pacientes SET
+               n_agendas=?, n_finalizadas=?, n_faltas=?, primeira_visita=?, ultima_atividade=?, ultima_agenda_status=?,
+               teve_a=?, teve_b=?, tem_futura=?, grupo_futuro=?, cauda_faltas=?,
+               n_orcamentos=?, tem_orc_aberto=?, ultimo_aprovado=?, status_ultimo_aprovado=?, cancelou_apos=?,
+               cobertura_pct=?, valor_aprovado_total=?, tem_orcado_nao_feito=?,
+               procedimentos_feitos=?, procedimentos_orcados=?, raw_flags=NULL, enriquecido=true, atualizado_em=now()
+             WHERE paciente_id_cnn=?`
+          ).bind(
+            ags.length,
+            ags.filter((a) => a.status === "FINALIZADO").length,
+            ags.filter((a) => a.status === "FALTOU").length,
+            datas.length ? datas[0] : null,
+            atividades.length ? atividades[atividades.length - 1] : null,
+            agsPass.length ? (agsPass[agsPass.length - 1].status || null) : null,
+            agsPass.some((a) => a.grupo === "A"),
+            agsPass.some((a) => a.grupo === "B"),
+            temFuturaReal,
+            grupoFuturoReal,
+            caudaFaltasReal,
+            orcs.length,
+            orcs.some((o: any) => o.status === "ABERTO"),
+            sinais.ultimoAprovadoISO,
+            aprovados.length ? (aprovados[aprovados.length - 1].status ?? null) : null,
+            sinais.cancelouAposAprovar,
+            Number(detalhe?.cobertura_pct ?? 0),
+            aprovados.reduce((s: number, o: any) => s + (Number(o.valorLiquido) || 0), 0),
+            temOrcadoNaoFeito,
+            JSON.stringify(procedimentosFeitos),
+            JSON.stringify(procedimentosOrcados),
+            pid
+          ).run();
+          feitos++;
+        } catch (e) {
+          // Erro de leitura/derivação de 1 paciente NÃO trava o lote: marca e segue.
+          erros++;
+          await env.DB.prepare(`UPDATE base_pacientes SET enriquecido=true, raw_flags=?, atualizado_em=now() WHERE paciente_id_cnn=?`)
+            .bind(JSON.stringify({ erro_leitura: true, erro: String(e).slice(0, 200) }), pid).run();
+        }
+      }
+      if (erros > 0) { // conta acumulada de erros de leitura no detalhe do estado
+        const estD: any = await env.DB.prepare(`SELECT detalhe FROM base_refresh_estado WHERE id=1`).first();
+        let d: any = {};
+        try { d = JSON.parse(estD?.detalhe || "{}"); } catch { d = {}; }
+        if (typeof d !== "object" || d === null || Array.isArray(d)) d = {};
+        d.erros_leitura = Number(d.erros_leitura ?? 0) + erros;
+        await env.DB.prepare(`UPDATE base_refresh_estado SET detalhe=? WHERE id=1`).bind(JSON.stringify(d)).run();
+      }
+      // Contador auto-corretivo (recontado do banco) + transição de fase ao zerar pendentes.
+      const pend: any = await env.DB.prepare(`SELECT COUNT(*) AS n FROM base_pacientes WHERE enriquecido=false`).first();
+      await env.DB.prepare(
+        `UPDATE base_refresh_estado SET fase=?, enriquecidos=(SELECT COUNT(*) FROM base_pacientes WHERE enriquecido=true), atualizado_em=now() WHERE id=1`
+      ).bind(Number(pend?.n ?? 0) === 0 ? "pronto" : "enriquecer").run();
+    }
+    // fase parado/pronto/erro: step é no-op (o widget decide chamar ?modo=start).
+    const st = await baseRefreshStatus(env);
+    return Response.json({ ...st, feitos_neste_step: feitos, erros_neste_step: erros });
+  } catch (e) {
+    const msg = String(e).slice(0, 500);
+    try {
+      await env.DB.prepare(`UPDATE base_refresh_estado SET fase='erro', detalhe=?, atualizado_em=now() WHERE id=1`).bind(msg).run();
+    } catch { /* estado inacessível — devolve só o erro */ }
+    let st: any = { ok: true, fase: "erro", pagina: 0, total_paginas: 0, total_pacientes: 0, enriquecidos: 0, pendentes: 0, detalhe: msg };
+    try { st = await baseRefreshStatus(env); } catch { /* mantém o fallback */ }
+    return Response.json({ ...st, ok: false, feitos_neste_step: feitos, erros_neste_step: erros, error: msg }, { status: 500 });
+  }
+}
+
 function discoverAuthOk(req: Request, env: Env): boolean {
   return req.headers.get("Authorization") === env.WEBHOOK_SECRET;
 }
@@ -7036,6 +7230,11 @@ export async function handleFetch(req: Request, env: Env): Promise<Response> {
       const cursor = u.searchParams.get("cursor") ?? "";
       const max = Math.min(Math.max(Number(u.searchParams.get("max") ?? "20"), 1), 60);
       return Response.json(await varrerAniversario(env, target, dry, cursor, max));
+    }
+
+    if (pathname === "/base-refresh") { // staging da base CNN→Supabase p/ o widget — read-only no CNN; escreve só base_pacientes/base_refresh_estado
+      if (!discoverAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+      return handleBaseRefresh(req, env);
     }
 
     if (pathname === "/discover") {
